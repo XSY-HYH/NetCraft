@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\NetCraft.Primitives\NetCraft.Primitives.csproj" />
+    <ProjectReference Include="..\NetCraft.Config\NetCraft.Config.csproj" />
+    <ProjectReference Include="..\NetCraft.Codec\NetCraft.Codec.csproj" />
+    <ProjectReference Include="..\NetCraft.Nbt\NetCraft.Nbt.csproj" />
+    <ProjectReference Include="..\NetCraft.Registry\NetCraft.Registry.csproj" />
+    <ProjectReference Include="..\NetCraft.Storage\NetCraft.Storage.csproj" />
+    <ProjectReference Include="..\NetCraft.DataFixer\NetCraft.DataFixer.csproj" />
+    <ProjectReference Include="..\NetCraft.Interop\NetCraft.Interop.csproj" />
+    <ProjectReference Include="..\NetCraft.Tags\NetCraft.Tags.csproj" />
+    <ProjectReference Include="..\NetCraft.Resources\NetCraft.Resources.csproj" />
+    <ProjectReference Include="..\NetCraft.Network\NetCraft.Network.csproj" />
+    <ProjectReference Include="..\NetCraft.Commands\NetCraft.Commands.csproj" />
+    <ProjectReference Include="..\NetCraft.Bootstrap\NetCraft.Bootstrap.csproj" />
+    <ProjectReference Include="..\NetCraft.Gpu\NetCraft.Gpu.csproj" />
+    <ProjectReference Include="..\NetCraft.Game\NetCraft.Game.csproj" />
+    <ProjectReference Include="..\NetCraft.Optimizations\NetCraft.Optimizations.csproj" />
+  </ItemGroup>
+
+</Project>

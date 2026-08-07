@@ -1,0 +1,508 @@
+import { Card, CardBody } from '@heroui/card';
+import { useLocalStorage } from '@uidotdev/usehooks';
+import { useRequest } from 'ahooks';
+import clsx from 'clsx';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
+import remarkBreaks from 'remark-breaks';
+import key from '@/const/key';
+import useI18n from '@/hooks/use-i18n';
+
+import QQInfoCard from '@/components/qq_info_card';
+
+import QQManager from '@/controllers/qq_manager';
+import WebUIManager from '@/controllers/webui_manager';
+import { Image } from '@heroui/image';
+import { BiSolidMemoryCard } from 'react-icons/bi';
+import { GiCpu } from 'react-icons/gi';
+import { Button } from '@heroui/button';
+import { IoRefresh, IoCheckmarkCircle, IoAlertCircle, IoMegaphoneOutline } from 'react-icons/io5';
+
+import bkg from '@/assets/images/bg/1AD934174C0107F14BAD8776D29C5F90.png';
+
+const QQInfo: React.FC = () => {
+  const { data, loading, error } = useRequest(QQManager.getQQLoginInfo);
+  return <QQInfoCard data={data} error={error} loading={loading} />;
+};
+
+export interface SystemStatusCardProps {
+  setArchInfo: (arch: string | undefined) => void;
+}
+
+interface SystemStatusItemProps {
+  title: string;
+  value?: string | number;
+  size?: 'md' | 'lg';
+  unit?: string;
+  hasBackground?: boolean;
+}
+
+const SystemStatusItem: React.FC<SystemStatusItemProps> = ({
+  title,
+  value = '-',
+  size = 'md',
+  unit,
+  hasBackground = false,
+}) => {
+  return (
+    <div
+      className={clsx(
+        'py-1.5 text-sm transition-colors',
+        size === 'lg' ? 'col-span-2' : 'col-span-1 flex justify-between items-center'
+      )}
+    >
+      <div className={clsx(
+        'w-24 font-medium',
+        hasBackground ? 'text-white/90' : 'text-default-600 dark:text-gray-300'
+      )}
+      >{title}
+      </div>
+      <div className={clsx(
+        'font-mono text-xs',
+        hasBackground ? 'text-white/80' : 'text-default-500'
+      )}
+      >
+        {value}
+        {unit && <span className='ml-0.5 opacity-70'>{unit}</span>}
+      </div>
+    </div>
+  );
+};
+
+interface ProgressBarProps {
+  value: number;
+  label: string;
+  percentText: string;
+  hasBackground?: boolean;
+}
+
+const ProgressBar: React.FC<ProgressBarProps> = ({
+  value,
+  label,
+  percentText,
+  hasBackground = false,
+}) => {
+  return (
+    <div>
+      <div className='flex justify-between text-xs mb-1'>
+        <span className={hasBackground ? 'text-white/80' : 'text-default-500'}>{label}</span>
+        <span className={clsx('font-mono', hasBackground ? 'text-white/80' : 'text-default-500')}>
+          {percentText}
+        </span>
+      </div>
+      <div
+        className={clsx(
+          'h-2 rounded-full overflow-hidden',
+          hasBackground ? 'bg-white/20' : 'bg-default-200 dark:bg-default-700'
+        )}
+      >
+        <div
+          className='h-full rounded-full transition-all duration-300 bg-primary-500'
+          style={{ width: `${Math.min(100, Math.max(0, value))}%` }}
+        />
+      </div>
+    </div>
+  );
+};
+
+const SystemStatusCard: React.FC<SystemStatusCardProps> = ({ setArchInfo }) => {
+  const { t } = useI18n();
+  const [systemStatus, setSystemStatus] = useLocalStorage<SystemStatus | undefined>('napcat_system_status_cache', undefined);
+  const isSetted = useRef(false);
+  const [backgroundImage] = useLocalStorage<string>(key.backgroundImage, '');
+  const hasBackground = !!backgroundImage;
+
+  const getStatus = useCallback(() => {
+    try {
+      const event = WebUIManager.getSystemStatus(setSystemStatus);
+      return event;
+    } catch (_error) {
+      // ignore
+    }
+  }, []);
+
+  useEffect(() => {
+    const close = getStatus();
+    return () => {
+      close?.close();
+    };
+  }, [getStatus]);
+
+  useEffect(() => {
+    if (systemStatus?.arch && !isSetted.current) {
+      setArchInfo(systemStatus.arch);
+      isSetted.current = true;
+    }
+  }, [systemStatus, setArchInfo]);
+
+  const memoryUsagePercent = systemStatus
+    ? (Number(systemStatus.memory.usage.system) / (Number(systemStatus.memory.total) || 1)) * 100
+    : 0;
+
+  return (
+    <Card className={clsx(
+      'backdrop-blur-sm border border-white/40 dark:border-white/10 shadow-sm relative overflow-hidden flex-1',
+      hasBackground ? 'bg-white/10 dark:bg-black/10' : 'bg-white/60 dark:bg-black/40'
+    )}
+    >
+      <div className='absolute h-full right-0 top-0'>
+        <Image
+          src={bkg}
+          alt='background'
+          className='select-none pointer-events-none !opacity-30 w-full h-full'
+          classNames={{
+            wrapper: 'w-full h-full',
+            img: 'object-contain w-full h-full',
+          }}
+        />
+      </div>
+      <CardBody className='overflow-visible gap-4 items-stretch z-10 p-4'>
+        <div className='flex-1 w-full'>
+          <h2 className={clsx(
+            'text-lg font-semibold flex items-center gap-2 mb-3',
+            hasBackground ? 'text-white drop-shadow-sm' : 'text-default-700 dark:text-gray-200'
+          )}
+          >
+            <GiCpu className='text-xl opacity-80' />
+            <span>CPU</span>
+          </h2>
+          <div className='grid grid-cols-2 gap-2 mb-4'>
+            <SystemStatusItem title={t('webui.dashboard.cpu_model')} value={systemStatus?.cpu.model} size='lg' hasBackground={hasBackground} />
+            <SystemStatusItem title={t('webui.dashboard.cpu_cores')} value={systemStatus?.cpu.core} hasBackground={hasBackground} />
+            <SystemStatusItem title={t('webui.dashboard.cpu_speed')} value={systemStatus?.cpu.speed} unit='GHz' hasBackground={hasBackground} />
+          </div>
+          <ProgressBar
+            value={Number(systemStatus?.cpu.usage.system) || 0}
+            label={t('webui.dashboard.cpu_usage')}
+            percentText={`${systemStatus?.cpu.usage.system || 0}%`}
+            hasBackground={hasBackground}
+          />
+        </div>
+        <div className='flex-1 w-full'>
+          <h2 className={clsx(
+            'text-lg font-semibold flex items-center gap-2 mb-3',
+            hasBackground ? 'text-white drop-shadow-sm' : 'text-default-700 dark:text-gray-200'
+          )}
+          >
+            <BiSolidMemoryCard className='text-xl opacity-80' />
+            <span>{t('webui.dashboard.memory')}</span>
+          </h2>
+          <div className='grid grid-cols-2 gap-2 mb-4'>
+            <SystemStatusItem
+              title={t('webui.dashboard.memory_total')}
+              value={systemStatus?.memory.total}
+              size='lg'
+              unit='MB'
+              hasBackground={hasBackground}
+            />
+            <SystemStatusItem
+              title={t('webui.dashboard.memory_used')}
+              value={systemStatus?.memory.usage.system}
+              unit='MB'
+              hasBackground={hasBackground}
+            />
+          </div>
+          <ProgressBar
+            value={memoryUsagePercent}
+            label={t('webui.dashboard.memory_usage')}
+            percentText={`${memoryUsagePercent.toFixed(1)}%`}
+            hasBackground={hasBackground}
+          />
+        </div>
+      </CardBody>
+    </Card>
+  );
+};
+
+interface VersionInfo {
+  name: string;
+  version: string;
+  description: string;
+}
+
+const VersionCard: React.FC = () => {
+  const { t } = useI18n();
+  const [backgroundImage] = useLocalStorage<string>(key.backgroundImage, '');
+  const hasBackground = !!backgroundImage;
+  const [checking, setChecking] = useState(false);
+  const [remoteVersion, setRemoteVersion] = useState<string>('');
+  const [hasUpdate, setHasUpdate] = useState<boolean | null>(null);
+  const [showUpdateDialog, setShowUpdateDialog] = useState(false);
+
+  const { data: versionInfo, loading: versionLoading } = useRequest(WebUIManager.GetOneBotVersion);
+
+  const checkUpdate = async () => {
+    setChecking(true);
+    try {
+      const result = await WebUIManager.CheckUpdate();
+      if (result?.success) {
+        setRemoteVersion(result.remote_version || '');
+        setHasUpdate(result.has_update);
+      } else {
+        setRemoteVersion('');
+        setHasUpdate(null);
+      }
+    } catch (error) {
+      setHasUpdate(null);
+    } finally {
+      setChecking(false);
+    }
+  };
+
+  const performUpdate = async () => {
+    try {
+      await fetch('/api/base/PerformUpdate', { method: 'POST' });
+    } catch (error) {
+      // ignore
+    }
+    setShowUpdateDialog(false);
+  };
+
+  return (
+    <Card className={clsx(
+      'backdrop-blur-sm border border-white/40 dark:border-white/10 shadow-sm',
+      hasBackground ? 'bg-white/10 dark:bg-black/10' : 'bg-white/60 dark:bg-black/40'
+    )}
+    >
+      <CardBody className='p-4'>
+        <div className='flex items-center justify-between mb-3'>
+          <h2 className={clsx(
+            'text-lg font-semibold flex items-center gap-2',
+            hasBackground ? 'text-white drop-shadow-sm' : 'text-default-700 dark:text-gray-200'
+          )}
+          >
+            <span>{t('webui.dashboard.version')}</span>
+          </h2>
+          <Button
+            size='sm'
+            variant='flat'
+            color='primary'
+            onPress={checkUpdate}
+            isLoading={checking}
+            startContent={!checking && <IoRefresh className='text-base' />}
+          >
+            {t('webui.dashboard.check_update')}
+          </Button>
+        </div>
+        
+        <div className='space-y-2'>
+          <div className='flex justify-between items-center'>
+            <span className={clsx('text-sm', hasBackground ? 'text-white/80' : 'text-default-500')}>
+              {t('webui.dashboard.current_version')}
+            </span>
+            <span className={clsx('font-mono text-sm', hasBackground ? 'text-white/90' : 'text-default-700')}>
+              {versionLoading ? t('webui.dashboard.loading') : `v${versionInfo?.version || '1.0.0'}`}
+            </span>
+          </div>
+          
+          {remoteVersion && (
+            <div className='flex justify-between items-center'>
+              <span className={clsx('text-sm', hasBackground ? 'text-white/80' : 'text-default-500')}>
+                {t('webui.dashboard.latest_version')}
+              </span>
+              <span className={clsx('font-mono text-sm flex items-center gap-1', hasBackground ? 'text-white/90' : 'text-default-700')}>
+                {hasUpdate ? (
+                  <span
+                    className='cursor-pointer text-primary-500 hover:text-primary-400 underline decoration-dashed underline-offset-2'
+                    onClick={() => setShowUpdateDialog(true)}
+                  >
+                    {remoteVersion}
+                  </span>
+                ) : (
+                  <span>{remoteVersion}</span>
+                )}
+                {hasUpdate === true && (
+                  <IoAlertCircle className='text-warning-500' title={t('webui.dashboard.new_version_available')} />
+                )}
+                {hasUpdate === false && (
+                  <IoCheckmarkCircle className='text-success-500' title={t('webui.dashboard.up_to_date')} />
+                )}
+              </span>
+            </div>
+          )}
+        </div>
+
+        {showUpdateDialog && (
+          <div className='mt-3 p-3 rounded-lg bg-default-100/50 border border-default-200'>
+            <p className='text-sm text-default-600 mb-2'>
+              {t('webui.dashboard.update_prompt', remoteVersion)}
+            </p>
+            <div className='flex gap-2 justify-end'>
+              <Button size='sm' variant='flat' onPress={() => setShowUpdateDialog(false)}>
+                {t('webui.dashboard.cancel')}
+              </Button>
+              <Button size='sm' color='primary' onPress={performUpdate}>
+                {t('webui.dashboard.confirm_update')}
+              </Button>
+            </div>
+          </div>
+        )}
+      </CardBody>
+    </Card>
+  );
+};
+
+const ReleaseNotesCard: React.FC = () => {
+  const { t } = useI18n();
+  const [backgroundImage] = useLocalStorage<string>(key.backgroundImage, '');
+  const hasBackground = !!backgroundImage;
+  const [content, setContent] = useState<string>('');
+  const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [fetchedAt, setFetchedAt] = useState<string>('');
+
+  // 本地缓存：避免每次打开都白屏等待
+  const loadFromCache = () => {
+    try {
+      const cached = localStorage.getItem(key.releaseNotesCache);
+      if (cached) {
+        const parsed = JSON.parse(cached);
+        if (parsed?.content) {
+          setContent(parsed.content);
+          setFetchedAt(parsed.fetchedAt || '');
+          return true;
+        }
+      }
+    } catch { /* ignore */ }
+    return false;
+  };
+
+  const saveToCache = (text: string, at: string) => {
+    try {
+      localStorage.setItem(key.releaseNotesCache, JSON.stringify({ content: text, fetchedAt: at }));
+    } catch { /* ignore */ }
+  };
+
+  const fetchNotes = async (force: boolean) => {
+    if (force) setRefreshing(true); else setLoading(true);
+    setError(null);
+    try {
+      const result = await WebUIManager.GetReleaseNotes(force);
+      if (result?.success && result.content) {
+        setContent(result.content);
+        setFetchedAt(result.fetchedAt || '');
+        saveToCache(result.content, result.fetchedAt || '');
+      } else if (result?.success && !result.content) {
+        setError(t('webui.dashboard.no_release_notes'));
+      } else {
+        setError(result?.error || t('webui.dashboard.load_release_notes_failed'));
+      }
+    } catch {
+      setError(t('webui.dashboard.load_release_notes_failed'));
+    } finally {
+      if (force) setRefreshing(false); else setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    // 先用本地缓存秒开，再后台静默刷新
+    const hasCache = loadFromCache();
+    if (hasCache) {
+      setLoading(false);
+      // 后台静默刷新（不显示 loading）
+      fetchNotes(false);
+    } else {
+      fetchNotes(false);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  return (
+    <Card className={clsx(
+      'backdrop-blur-sm border border-white/40 dark:border-white/10 shadow-sm',
+      hasBackground ? 'bg-white/10 dark:bg-black/10' : 'bg-white/60 dark:bg-black/40'
+    )}
+    >
+      <CardBody className='p-4'>
+        <div className='flex items-center justify-between mb-3'>
+          <h2 className={clsx(
+            'text-lg font-semibold flex items-center gap-2',
+            hasBackground ? 'text-white drop-shadow-sm' : 'text-default-700 dark:text-gray-200'
+          )}
+          >
+            <IoMegaphoneOutline className='text-xl opacity-80' />
+            <span>{t('webui.dashboard.release_notes')}</span>
+          </h2>
+          <button
+            type='button'
+            onClick={() => fetchNotes(true)}
+            disabled={refreshing}
+            title={t('webui.dashboard.refresh_release_notes')}
+            className={clsx(
+              'p-1.5 rounded-lg transition-colors',
+              hasBackground ? 'text-white/80 hover:bg-white/10' : 'text-default-500 hover:bg-default-100',
+              refreshing && 'opacity-50 cursor-not-allowed'
+            )}
+          >
+            <IoRefresh className={clsx('text-base', refreshing && 'animate-spin')} />
+          </button>
+        </div>
+
+        {loading ? (
+          <div className='text-sm text-default-400'>{t('webui.dashboard.loading')}</div>
+        ) : error ? (
+          <div className='text-sm text-default-400'>{error}</div>
+        ) : (
+          <>
+            {fetchedAt && (
+              <div className={clsx(
+                'text-[10px] mb-2 opacity-60',
+                hasBackground ? 'text-white' : 'text-default-400'
+              )}>
+                {t('webui.dashboard.release_notes_fetched_at', { time: fetchedAt })}
+              </div>
+            )}
+            <div className='prose prose-sm dark:prose-invert max-w-none'>
+              <ReactMarkdown
+                remarkPlugins={[remarkGfm, remarkBreaks]}
+                components={{
+                  p: ({ children }) => <p className='mb-2 last:mb-0'>{children}</p>,
+                  li: ({ children }) => <li className='mb-1'>{children}</li>,
+                  ul: ({ children }) => <ul className='mb-2 list-disc pl-4'>{children}</ul>,
+                  h1: ({ children }) => <h1 className='text-base font-bold mb-2'>{children}</h1>,
+                  h2: ({ children }) => <h2 className='text-base font-bold mt-3 mb-2'>{children}</h2>,
+                  h3: ({ children }) => <h3 className='text-sm font-bold mt-2 mb-1'>{children}</h3>,
+                  hr: () => <hr className='my-3 border-default-200' />,
+                }}
+              >
+                {content}
+              </ReactMarkdown>
+            </div>
+          </>
+        )}
+      </CardBody>
+    </Card>
+  );
+};
+
+const DashboardIndexPage: React.FC = () => {
+  const { t } = useI18n();
+  const [archInfo, setArchInfo] = useLocalStorage<string | undefined>('napcat_arch_info_cache', undefined);
+
+  return (
+    <>
+      <title>{t('webui.dashboard.title')}</title>
+      <section className='w-full p-2 md:p-4 md:max-w-[1000px] mx-auto overflow-hidden'>
+        <div className='grid grid-cols-1 lg:grid-cols-2 gap-4 items-stretch'>
+          <QQInfo />
+          <SystemStatusCard setArchInfo={setArchInfo} />
+        </div>
+        <div className='mt-4'>
+          <VersionCard />
+        </div>
+        <div className='mt-4'>
+          <ReleaseNotesCard />
+        </div>
+        <div className='w-full text-right mt-4'>
+          <p className='text-sm text-default-400 italic'>
+            {t('webui.dashboard.credit')}
+          </p>
+        </div>
+      </section>
+    </>
+  );
+};
+
+export default DashboardIndexPage;

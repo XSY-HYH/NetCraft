@@ -1,0 +1,54 @@
+#.NET 编译输出
+bin/
+obj/
+[Bb]in/
+[Oo]bj/
+
+#IDE
+.vs/
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+*.code-workspace
+*.user
+*.suo
+*.userprefs
+*.swp
+.history/
+*.app
+.snapshots/*
+
+#Node 前端
+node_modules/
+dist/
+.vite/
+webui - 副本/
+
+#日志与临时文件
+*.log
+temp*.py
+test_*.log
+__*.log
+
+#环境配置
+.env
+.env.local
+.env.*.local
+
+#系统文件
+Thumbs.db
+.DS_Store
+
+#构建产物
+*.dll
+*.exe
+*.pdb
+*.pdb.lock
+NetCraft.TPGA/wwwroot/
+
+#Minecraft jar 反编译资源运行时由 AssetsExtractor 提取
+NetCraft.Loader/assets/
+NetCraft.Loader/server.properties

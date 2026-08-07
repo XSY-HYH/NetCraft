@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    NetCraft.Loader 启动器（控制台 EXE）
+    职责：解析顶层模式参数 server/client 分发到 ServerMain/ClientMain
+    其余参数透传给 Run 由现有 LaunchOptions+GameOptions 事件机制解析
+    引用 NetCraft 主库获取 LaunchOptions/NetCraftKernel
+    引用 NetCraft.Game 获取 ServerMain/ClientMain
+  -->
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>NetCraft.Loader</AssemblyName>
+    <RootNamespace>NetCraft.Loader</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\NetCraft\NetCraft.csproj" />
+    <ProjectReference Include="..\NetCraft.Game\NetCraft.Game.csproj" />
+  </ItemGroup>
+
+</Project>
