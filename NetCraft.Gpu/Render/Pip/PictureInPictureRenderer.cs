@@ -104,7 +104,8 @@ public abstract class PictureInPictureRenderer<T> : IPictureInPictureRenderer, I
     protected abstract TextureSetup GetBlitTextureSetup();
 
     //DisposeTextures 释放 offscreen texture 尺寸变化或 Dispose 时调
-    private void DisposeTextures()
+    //virtual 供双缓冲子类 override 释放多个 texture/encoder 基类只释放单个
+    protected virtual void DisposeTextures()
     {
         OffscreenTexture?.Dispose();
         OffscreenDepth?.Dispose();

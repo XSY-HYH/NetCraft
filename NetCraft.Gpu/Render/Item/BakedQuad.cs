@@ -61,6 +61,14 @@ public sealed class QuadInstance
     public int OverlayCoords;
 
     public int GetColor(int vertex) => Color;
+    //GetLightCoordsWithEmission 合并方块自身发光到 blockLight 段不动 sky 段
+    //emission 与 unpacked blockLight 取 max 后重新 pack 对齐原版 face light 合并语义
     public int GetLightCoordsWithEmission(int vertex, int lightEmission)
-        => LightCoords;
+    {
+        if (lightEmission <= 0) return LightCoords;
+        var blockLight = LightTexture.UnpackBlockLight(LightCoords);
+        var skyLight = LightTexture.UnpackSkyLight(LightCoords);
+        if (lightEmission > blockLight) blockLight = lightEmission;
+        return LightTexture.PackLightCoords(blockLight, skyLight);
+    }
 }

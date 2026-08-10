@@ -193,8 +193,8 @@ public static class RenderPipelines
         .WithPrimitiveTopology(PrimitiveTopology.Quads)
         .Build());
 
-    //Register 注册 pipeline 到按 location 索引表
-    private static RenderPipeline Register(RenderPipeline pipeline)
+    //Register 注册 pipeline 到按 location 索引表 供 WorldRenderPipelines 等外部声明复用
+    internal static RenderPipeline Register(RenderPipeline pipeline)
     {
         s_pipelinesByLocation[pipeline.Location] = pipeline;
         return pipeline;

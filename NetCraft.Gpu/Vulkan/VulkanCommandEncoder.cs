@@ -22,6 +22,11 @@ public sealed unsafe class VulkanCommandEncoder : ICommandEncoder
     //WriteToTexture 创建的 staging buffer 生命周期延到 Submit 后统一释放
     //Submit 调 WaitForFences 等 GPU 执行完才能安全释放 staging buffer
     private readonly List<VulkanBuffer> _stagingBuffers = new();
+    //_pendingStagingBuffers SubmitAsync 时 staging 转入待释放列表等 WaitForCompletion 释放
+    //异步 Submit 不能立即释放 staging GPU 还在读需等 fence 完成
+    private readonly List<VulkanBuffer> _pendingStagingBuffers = new();
+    //_pendingSubmit SubmitAsync 后未 WaitForCompletion 标记 BeginRecording 前必须先 WaitForCompletion
+    private bool _pendingSubmit;
     private bool _disposed;
     private bool _recording;
 
@@ -175,6 +180,59 @@ public sealed unsafe class VulkanCommandEncoder : ICommandEncoder
         _stagingBuffers.Clear();
     }
 
+    //SubmitAsync 提交命令到 GPU 队列不等完成供 PIP 双缓冲异步渲染
+    //staging buffer 转入 _pendingStagingBuffers 延迟到 WaitForCompletion 释放
+    //调用方下次复用本 encoder 前必须 WaitForCompletion 保证 GPU 完成才能 Reset command buffer
+    public void SubmitAsync()
+    {
+        if (!_recording) return;
+        if (_vk.EndCommandBuffer(_handle) != Result.Success)
+            throw new InvalidOperationException("命令缓冲结束录制失败");
+        _recording = false;
+        var cmd = _handle;
+        var fence = _submitFence;
+        var submitInfo = new SubmitInfo
+        {
+            SType = StructureType.SubmitInfo,
+            CommandBufferCount = 1
+        };
+        submitInfo.PCommandBuffers = &cmd;
+        if (_vk.QueueSubmit(_graphicsQueue, 1, &submitInfo, fence) != Result.Success)
+            throw new InvalidOperationException("QueueSubmit 失败");
+        _pendingSubmit = true;
+        _pendingStagingBuffers.AddRange(_stagingBuffers);
+        _stagingBuffers.Clear();
+    }
+
+    //WaitForCompletion 等 SubmitAsync 提交的 GPU 命令完成
+    //未 SubmitAsync 过（_pendingSubmit=false）直接返回首次复用 encoder 安全跳过
+    //完成后 ResetFences 让 fence 可供下次 QueueSubmit 复用并释放待释放 staging
+    public void WaitForCompletion()
+    {
+        if (!_pendingSubmit) return;
+        var fence = _submitFence;
+        _vk.WaitForFences(_device, 1, &fence, Vk.True, ulong.MaxValue);
+        _vk.ResetFences(_device, 1, &fence);
+        foreach (var sb in _pendingStagingBuffers) sb.Dispose();
+        _pendingStagingBuffers.Clear();
+        _pendingSubmit = false;
+    }
+
+    //BeginRecording 重新开始命令录制供 encoder 跨帧复用
+    //首次调用幂等（构造已 BeginCommandBuffer）_recording=true 直接返回
+    //后续调用需先 WaitForCompletion 保证 GPU 不再使用 command buffer 再 Reset+Begin
+    public void BeginRecording()
+    {
+        if (_recording) return;
+        if (_pendingSubmit)
+            throw new InvalidOperationException("SubmitAsync 后未 WaitForCompletion 不能 BeginRecording");
+        _vk.ResetCommandBuffer(_handle, CommandBufferResetFlags.None);
+        var beginInfo = new CommandBufferBeginInfo { SType = StructureType.CommandBufferBeginInfo };
+        if (_vk.BeginCommandBuffer(_handle, &beginInfo) != Result.Success)
+            throw new InvalidOperationException("命令缓冲开始录制失败");
+        _recording = true;
+    }
+
     private void EnsureRecording()
     {
         if (!_recording) throw new InvalidOperationException("CommandEncoder 已 Submit 不能再录制");
@@ -183,8 +241,16 @@ public sealed unsafe class VulkanCommandEncoder : ICommandEncoder
     public void Dispose()
     {
         if (_disposed) return;
+        //异步 Submit 未等完成时先等 fence 保证 GPU 不再使用 command buffer 再 Free
+        if (_pendingSubmit)
+        {
+            var waitFence = _submitFence;
+            _vk.WaitForFences(_device, 1, &waitFence, Vk.True, ulong.MaxValue);
+        }
         foreach (var sb in _stagingBuffers) sb.Dispose();
         _stagingBuffers.Clear();
+        foreach (var sb in _pendingStagingBuffers) sb.Dispose();
+        _pendingStagingBuffers.Clear();
         var cmd = _handle;
         _vk.FreeCommandBuffers(_device, _commandPool, 1, &cmd);
         var fence = _submitFence;

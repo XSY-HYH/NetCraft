@@ -169,11 +169,54 @@ public sealed class StagedVertexBuffer : IDisposable
                         WriteFloat(_buffer._vertices, v);
                         break;
                     case "Color":
-                        //color 是 ARGB (0xAARRGGBB) 提取为 RGBA 字节顺序
+                        //2D 格式 Color 是 UByte4Norm ARGB int 拆 RGBA 字节顺序
                         _buffer._vertices.Add((byte)((color >> 16) & 0xFF));
                         _buffer._vertices.Add((byte)((color >> 8) & 0xFF));
                         _buffer._vertices.Add((byte)(color & 0xFF));
                         _buffer._vertices.Add((byte)((color >> 24) & 0xFF));
+                        break;
+                    default:
+                        //未知元素填零保持 stride 对齐
+                        for (int i = 0; i < SizeOf(elem.Format); i++)
+                            _buffer._vertices.Add((byte)0);
+                        break;
+                }
+            }
+            _draw.VertexCount++;
+        }
+
+        //AddVertex3D 写 3D 顶点 position+color+uv+light+normal 对应 POSITION_COLOR_UV_LIGHT_NORMAL
+        //position 和 normal 由调用方预先变换好 color/light 是 int 当 float 位模式写入 shader 用 int() 解包
+        public void AddVertex3D(float x, float y, float z, int color,
+            float u, float v, int light, float nx, float ny, float nz)
+        {
+            foreach (var elem in _draw.VertexFormat.Elements)
+            {
+                switch (elem.Name)
+                {
+                    case "Position":
+                        WriteFloat(_buffer._vertices, x);
+                        WriteFloat(_buffer._vertices, y);
+                        WriteFloat(_buffer._vertices, z);
+                        break;
+                    case "Color":
+                        //3D 格式 Color 是 Float ARGB int 数值转换写入 shader int() 还原
+                        //不能用位模式转换 0xFFFFFFFF 位模式是 NaN shader int(NaN) 未定义
+                        WriteFloat(_buffer._vertices, (float)color);
+                        break;
+                    case "UV0":
+                        WriteFloat(_buffer._vertices, u);
+                        WriteFloat(_buffer._vertices, v);
+                        break;
+                    case "Light":
+                        //Light 是 Float (block<<4)|(sky<<20) packed int 数值转换写入
+                        //light 值在 2^24 内 float 精确表示无精度损失
+                        WriteFloat(_buffer._vertices, (float)light);
+                        break;
+                    case "Normal":
+                        WriteFloat(_buffer._vertices, nx);
+                        WriteFloat(_buffer._vertices, ny);
+                        WriteFloat(_buffer._vertices, nz);
                         break;
                     default:
                         //未知元素填零保持 stride 对齐

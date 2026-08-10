@@ -13,10 +13,10 @@ public static class ItemFeatureRenderer
     //无 overlay
     public const int NoOverlay = 0;
 
-    //Execute 把 collector 的所有 submit node 渲染到 VertexConsumer
-    //每个 node 用其 pose 快照重建临时 PoseStack 再 putBakedQuad
+    //Execute 把 collector 的所有 submit node 渲染到 IVertexConsumer
+    //每个 node 用其 pose 快照重建临时 PoseStack 再 PutBakedQuad
     //tint 颜色按 quad.TintIndex 查 ItemTints.GetTint 应用到顶点 color 字段
-    public static void Execute(ItemSubmitCollector collector, VertexConsumer3D consumer)
+    public static void Execute(ItemSubmitCollector collector, IVertexConsumer consumer)
     {
         var tempPose = new PoseStack();
         var instance = new QuadInstance();
@@ -29,7 +29,7 @@ public static class ItemFeatureRenderer
             foreach (var quad in node.Quads)
             {
                 instance.Color = ItemTints.GetTint(quad.TintIndex);
-                consumer.PutBakedQuad(tempPose, in quad, instance);
+                VertexConsumer3D.PutBakedQuad(consumer, tempPose, in quad, instance);
             }
         }
     }

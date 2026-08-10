@@ -1,3 +1,4 @@
+using NetCraft.Game.Client.Render.Model;
 using NetCraft.Gpu;
 using NetCraft.Registry.State;
 using NetCraft.Storage.Chunk;
@@ -8,24 +9,28 @@ namespace NetCraft.Game.Client.Render.World;
 //遍历 LevelChunkSection 16³ 方块对非空方块查 BakedModel 按 cullface+邻居 BlockRenderShape 剔除面
 //cullface quad 邻居是 FullBlock 则剔除该方向面 no-cull quad 总是渲染
 //顶点位置由 BlockModelBaker 产出 0-16 范围经 PoseStack scale(1/16) 归一化到 0-1 再 translate(x,y,z) 平移到方块位置
-//首版不跨 section 边界邻居查询超出 0-15 视为 air 不剔除（多渲染边界面功能正确）
-//光照占位 QuadInstance Color=-1 全白 LightCoords=0 等 W4 光照引擎接入
+//originX/Y/Z 是 section 世界基坐标光照查询用首版不跨 section 边界邻居查询超出 0-15 视为 air 不剔除
+//光照通过 ChunkLightSampler 查面外侧邻居的 block/sky light null 时走 FullBright 兼容旧测试
+//face-based shading 按 quad.Direction 固定 shade 系数 bake 进 Color RGB 对齐原版 face 拣选
 //流体渲染不含 FluidRenderer 是独立子系统后续补
 public sealed class ChunkMeshBuilder
 {
     private readonly Func<BlockState, BakedModel?> _modelMapper;
+    private readonly ChunkLightSampler? _lightSampler;
 
-    public ChunkMeshBuilder(BlockStateModelMapper modelMapper)
-        : this(modelMapper.GetModel) { }
+    public ChunkMeshBuilder(BlockStateModelMapper modelMapper, ChunkLightSampler? lightSampler = null)
+        : this(modelMapper.GetModel, lightSampler) { }
 
     //Func 构造供测试注入 stub 映射避免依赖 ResourceManager
-    public ChunkMeshBuilder(Func<BlockState, BakedModel?> modelMapper)
+    public ChunkMeshBuilder(Func<BlockState, BakedModel?> modelMapper, ChunkLightSampler? lightSampler = null)
     {
         _modelMapper = modelMapper;
+        _lightSampler = lightSampler;
     }
 
     //Build 遍历 section 16³ 方块生成 mesh 数据
-    public ChunkMeshData Build(LevelChunkSection section)
+    //originX/Y/Z 是 section 世界基坐标光照查询用默认 0 兼容无世界坐标的单测
+    public ChunkMeshData Build(LevelChunkSection section, int originX = 0, int originY = 0, int originZ = 0)
     {
         var mesh = new ChunkMeshData();
         var pose = new PoseStack();
@@ -40,31 +45,34 @@ public sealed class ChunkMeshBuilder
             if (model is null)
                 continue;
             pose.PushPose();
-            pose.Translate(x, y, z);
             pose.Scale(1f / 16f, 1f / 16f, 1f / 16f);
-            AddBlockQuads(pose, section, x, y, z, model, mesh);
+            //translate 加 sectionOrigin 把顶点 bake 到世界坐标 shader 端 Model=Identity
+            //W7 LevelRenderer 用相机相对坐标减 CameraPosition 大世界 float 精度问题留 W8
+            pose.Translate(x + originX, y + originY, z + originZ);
+            AddBlockQuads(pose, section, x, y, z, originX, originY, originZ, model, mesh);
             pose.PopPose();
         }
         return mesh;
     }
 
     //AddBlockQuads 把方块的 BakedModel quad 按 layer + cullface 写入 mesh
-    private static void AddBlockQuads(PoseStack pose, LevelChunkSection section,
-        int x, int y, int z, BakedModel model, ChunkMeshData mesh)
+    private void AddBlockQuads(PoseStack pose, LevelChunkSection section,
+        int x, int y, int z, int originX, int originY, int originZ, BakedModel model, ChunkMeshData mesh)
     {
-        var instance = new QuadInstance { Color = -1, LightCoords = 0 };
+        var instance = new QuadInstance();
         foreach (var layer in model.Layers)
         {
             //cullface quad：按方向查邻居 FullBlock 则剔除
-            AddCullfaceQuads(pose, section, x, y, z, model, layer, mesh, instance);
+            AddCullfaceQuads(pose, section, x, y, z, originX, originY, originZ, model, layer, mesh, instance);
             //no-cull quad：总是渲染
-            AddNoCullQuads(pose, model, layer, mesh, instance);
+            AddNoCullQuads(pose, x, y, z, originX, originY, originZ, model, layer, mesh, instance);
         }
     }
 
     //AddCullfaceQuads 遍历 6 方向 cullface quad 邻居是 FullBlock 则跳过该方向
-    private static void AddCullfaceQuads(PoseStack pose, LevelChunkSection section,
-        int x, int y, int z, BakedModel model, RenderLayer layer, ChunkMeshData mesh, QuadInstance instance)
+    private void AddCullfaceQuads(PoseStack pose, LevelChunkSection section,
+        int x, int y, int z, int originX, int originY, int originZ,
+        BakedModel model, RenderLayer layer, ChunkMeshData mesh, QuadInstance instance)
     {
         foreach (var dir in AllDirections)
         {
@@ -73,19 +81,29 @@ public sealed class ChunkMeshBuilder
             if (ShouldCullFace(section, x, y, z, dir)) continue;
             var consumer = mesh.GetOrBeginLayer(layer);
             for (var i = 0; i < quads.Count; i++)
-                consumer.PutBakedQuad(pose, quads[i], instance);
+            {
+                var quad = quads[i];
+                instance.Color = ApplyFaceShade(-1, quad.Direction);
+                instance.LightCoords = GetLightForFace(x, y, z, originX, originY, originZ, dir, quad.LightEmission);
+                VertexConsumer3D.PutBakedQuad(consumer, pose, quad, instance);
+            }
         }
     }
 
     //AddNoCullQuads 写入无 cullface 的 quad 总是渲染
-    private static void AddNoCullQuads(PoseStack pose, BakedModel model,
-        RenderLayer layer, ChunkMeshData mesh, QuadInstance instance)
+    private void AddNoCullQuads(PoseStack pose, int x, int y, int z, int originX, int originY, int originZ,
+        BakedModel model, RenderLayer layer, ChunkMeshData mesh, QuadInstance instance)
     {
         var quads = model.GetNoCullQuads(layer);
         if (quads.Count == 0) return;
         var consumer = mesh.GetOrBeginLayer(layer);
         for (var i = 0; i < quads.Count; i++)
-            consumer.PutBakedQuad(pose, quads[i], instance);
+        {
+            var quad = quads[i];
+            instance.Color = ApplyFaceShade(-1, quad.Direction);
+            instance.LightCoords = GetLightForFace(x, y, z, originX, originY, originZ, quad.Direction, quad.LightEmission);
+            VertexConsumer3D.PutBakedQuad(consumer, pose, quad, instance);
+        }
     }
 
     //ShouldCullFace 判断当前方块某方向面是否被邻居遮挡应剔除
@@ -102,6 +120,43 @@ public sealed class ChunkMeshBuilder
         var neighbor = section.GetBlockState(nx, ny, nz);
         return BlockRenderShapeProvider.GetShape(neighbor) == BlockRenderShape.FullBlock;
     }
+
+    //GetLightForFace 查面外侧邻居位置的 packed light coords
+    //_lightSampler 为 null 时返回 FullBright 兼容无光照环境的单测
+    private int GetLightForFace(int x, int y, int z, int originX, int originY, int originZ,
+        Direction dir, int lightEmission)
+    {
+        if (_lightSampler is null) return LightTexture.FullBrightCoords;
+        var offset = dir.UnitVector();
+        var neighborX = originX + x + (int)offset.X;
+        var neighborY = originY + y + (int)offset.Y;
+        var neighborZ = originZ + z + (int)offset.Z;
+        return _lightSampler.GetLightCoords(neighborX, neighborY, neighborZ, lightEmission);
+    }
+
+    //ApplyFaceShade 把 face shade 系数 bake 进 Color 的 RGB 段保留 Alpha
+    //原版按轴分档 Y 轴 Up=1.0/Down=0.5 Z 轴 North/South=0.8 X 轴 East/West=0.6
+    private static int ApplyFaceShade(int color, Direction dir)
+    {
+        var shade = FaceShade(dir);
+        if (shade >= 1.0f) return color;
+        var a = (color >> 24) & 0xFF;
+        var r = (int)(((color >> 16) & 0xFF) * shade);
+        var g = (int)(((color >> 8) & 0xFF) * shade);
+        var b = (int)((color & 0xFF) * shade);
+        return (a << 24) | (r << 16) | (g << 8) | b;
+    }
+
+    private static float FaceShade(Direction dir) => dir switch
+    {
+        Direction.Down => 0.5f,
+        Direction.Up => 1.0f,
+        Direction.North => 0.8f,
+        Direction.South => 0.8f,
+        Direction.West => 0.6f,
+        Direction.East => 0.6f,
+        _ => 1.0f
+    };
 
     private static readonly Direction[] AllDirections =
     {

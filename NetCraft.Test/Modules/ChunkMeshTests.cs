@@ -1,10 +1,13 @@
 using System.Numerics;
+using NetCraft.Game.Client.Level;
 using NetCraft.Game.Client.Render.World;
 using NetCraft.Gpu;
+using NetCraft.Primitives;
 using NetCraft.Registry;
 using NetCraft.Registry.State;
 using NetCraft.Storage.Chunk;
 using NetCraft.Storage.Paletted;
+using Direction = NetCraft.Gpu.Direction;
 
 namespace NetCraft.Test.Modules;
 
@@ -25,6 +28,30 @@ internal static class ChunkMeshTests
         yield return ("ChunkMesh vertex position scaled to 0-1 and translated", TestVertexPosition);
         yield return ("ChunkMesh no-cull quads always rendered even when buried", TestNoCullAlwaysRendered);
         yield return ("ChunkMesh layers grouped separately", TestLayerGrouping);
+        yield return ("ChunkLightSampler basic light packs block/sky", TestLightSamplerBasicLight);
+        yield return ("ChunkLightSampler emission merges into blockLight", TestLightSamplerEmissionMerge);
+        yield return ("ChunkLightSampler cross-section boundary returns defaults", TestLightSamplerCrossSectionBoundary);
+        yield return ("ChunkMeshBuilder with light sampler preserves vertex count", TestChunkMeshBuilderWithLightSampler);
+        yield return ("ChunkMeshBuilder bakes sectionOrigin into vertex world position", TestChunkMeshBuilderBakeSectionOrigin);
+    }
+
+    //TestChunkMeshBuilderBakeSectionOrigin 验证 Build 传入 origin 后顶点位置 bake 到世界坐标
+    //方块在 section 内 (1,0,0) origin=(16,0,0) Up 面 p0=(0,16,0) 经 scale(1/16)+translate(17,0,0) = (0,1,0)+(17,0,0) = (17,1,0)
+    private static bool TestChunkMeshBuilderBakeSectionOrigin()
+    {
+        var (section, stone) = NewSectionWithAir();
+        section.SetBlockState(1, 0, 0, stone);
+        var builder = new ChunkMeshBuilder(_ => NewCubeBakedModel());
+        var mesh = builder.Build(section, originX: 16, originY: 0, originZ: 0);
+        var consumer = mesh.GetOrBeginLayer(RenderLayer.Solid);
+        //Up 面第 1 顶点索引 4 每顶点 10 float position 在 [0..2]
+        var upP0X = consumer.Vertices[4 * 10 + 0];
+        var upP0Y = consumer.Vertices[4 * 10 + 1];
+        var upP0Z = consumer.Vertices[4 * 10 + 2];
+        //方块世界 X = sectionOrigin(16) + 方块内 X(1) = 17
+        return Math.Abs(upP0X - 17f) < 1e-6f
+            && Math.Abs(upP0Y - 1f) < 1e-6f
+            && Math.Abs(upP0Z - 0f) < 1e-6f;
     }
 
     //全 air section 生成空 mesh
@@ -114,19 +141,19 @@ internal static class ChunkMeshTests
             && Math.Abs(upP0Z - 0f) < 1e-6f;
     }
 
-    //no-cull quad 即使被邻居 FullBlock 遮挡也渲染
+    //no-cull quad 不受 cullface 遮挡影响 总是渲染
     private static bool TestNoCullAlwaysRendered()
     {
         var (section, stone) = NewSectionWithAir();
         section.SetBlockState(1, 1, 1, stone);
-        section.SetBlockState(1, 2, 1, stone); //Up 邻居遮挡
+        section.SetBlockState(1, 2, 1, stone); //Up 邻居遮挡中心 Up 面
         //BakedModel 含 1 个 no-cull quad（Solid layer）
         var builder = new ChunkMeshBuilder(_ => NewNoCullBakedModel());
         var mesh = builder.Build(section);
-        //中心 stone: no-cull quad 1 个 * 4 顶点 = 4（cullface quad 全被邻居剔除）
-        //Up 邻居: no-cull quad 1 个 * 4 = 4（cullface Down 被中心剔除 其余 5 面 * 4 = 20）
-        //总 no-cull 顶点 = 2 * 4 = 8 cullface 顶点 = 5 * 4 = 20 总 28
-        return mesh.GetVertexCount(RenderLayer.Solid) == 28;
+        //中心 stone (1,1,1): Up 面被 (1,2,1) 遮挡 cullface 5 面*4=20 + no-cull 1*4=4 = 24
+        //Up 邻居 (1,2,1): Down 面被中心遮挡 cullface 5 面*4=20 + no-cull 1*4=4 = 24
+        //no-cull quad 不被剔除 总 48
+        return mesh.GetVertexCount(RenderLayer.Solid) == 48;
     }
 
     //BakedModel 有 Solid + Cutout layer 验证顶点分到正确 layer
@@ -209,6 +236,65 @@ internal static class ChunkMeshTests
             new(0, 0, 0), new(16, 0, 0), new(16, 16, 0), new(0, 16, 0),
             new(0, 0), new(1, 0), new(1, 1), new(0, 1), Direction.North), null);
         return model;
+    }
+
+    //NewClientLevelWithLight 构造 stub ClientLevel 装入指定 section 的均匀光照
+    //DataLayer.Fill 让全 section 所有位置返回同一光等级避免逐坐标 Set
+    private static ClientLevel NewClientLevelWithLight(int sectionX, int sectionY, int sectionZ, int blockLight, int skyLight)
+    {
+        var level = new ClientLevel();
+        var blockLayer = new DataLayer();
+        blockLayer.Fill(blockLight);
+        var skyLayer = new DataLayer();
+        skyLayer.Fill(skyLight);
+        level.LoadLight(new SectionPos(sectionX, sectionY, sectionZ), blockLayer, skyLayer);
+        return level;
+    }
+
+    //基础光照采样 block=10/sky=15 无 emission LightCoords=(10<<4)|(15<<20)
+    private static bool TestLightSamplerBasicLight()
+    {
+        var level = NewClientLevelWithLight(0, 0, 0, 10, 15);
+        var sampler = new ChunkLightSampler(level);
+        //面外侧邻居 (0,1,0) 落在 section(0,0,0) 装入 block=10/sky=15
+        var coords = sampler.GetLightCoords(0, 1, 0, 0);
+        return coords == LightTexture.PackLightCoords(10, 15);
+    }
+
+    //emission 合并 block=10/sky=15 emission=15 block 段提升到 15 sky 段不变
+    private static bool TestLightSamplerEmissionMerge()
+    {
+        var level = NewClientLevelWithLight(0, 0, 0, 10, 15);
+        var sampler = new ChunkLightSampler(level);
+        var coords = sampler.GetLightCoords(0, 1, 0, 15);
+        return LightTexture.UnpackBlockLight(coords) == 15
+            && LightTexture.UnpackSkyLight(coords) == 15;
+    }
+
+    //跨 section 边界 邻居在未装载 section 返回默认 block=0/sky=15
+    private static bool TestLightSamplerCrossSectionBoundary()
+    {
+        var level = NewClientLevelWithLight(0, 0, 0, 10, 15);
+        var sampler = new ChunkLightSampler(level);
+        //面外侧邻居 (0,-1,0) 落在 section(0,-1,0) 未装载 跨 section 边界
+        var coords = sampler.GetLightCoords(0, -1, 0, 0);
+        return LightTexture.UnpackBlockLight(coords) == 0
+            && LightTexture.UnpackSkyLight(coords) == 15;
+    }
+
+    //ChunkMeshBuilder 接入光照后顶点数与无光照一致 光照只改 light 字段不改 mesh 结构
+    private static bool TestChunkMeshBuilderWithLightSampler()
+    {
+        var (section, stone) = NewSectionWithAir();
+        section.SetBlockState(0, 0, 0, stone);
+        var level = NewClientLevelWithLight(0, 0, 0, 10, 15);
+        var sampler = new ChunkLightSampler(level);
+        var builderWithLight = new ChunkMeshBuilder(_ => NewCubeBakedModel(), sampler);
+        var builderNoLight = new ChunkMeshBuilder(_ => NewCubeBakedModel());
+        var meshWithLight = builderWithLight.Build(section, 0, 0, 0);
+        var meshNoLight = builderNoLight.Build(section, 0, 0, 0);
+        return meshWithLight.GetVertexCount(RenderLayer.Solid) == meshNoLight.GetVertexCount(RenderLayer.Solid)
+            && meshWithLight.GetVertexCount(RenderLayer.Solid) == 24;
     }
 
     private sealed class MockBlock : Block

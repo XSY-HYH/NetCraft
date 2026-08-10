@@ -22,7 +22,7 @@ internal static class RenderPipelinesTests
         yield return ("RenderPipelines.GUI registered with correct location", TestGuiRegistered);
         yield return ("RenderPipelines.GetStaticPipelines contains GUI variants", TestGetStaticPipelines);
         yield return ("RenderPipelines.GetByLocation returns registered pipeline", TestGetByLocation);
-        yield return ("RenderPipelines all 15 static pipelines registered with location", TestAllStaticPipelinesRegistered);
+        yield return ("RenderPipelines all 18 static pipelines registered with location", TestAllStaticPipelinesRegistered);
         yield return ("BlendFunction.LIGHTNING preset fields", TestBlendFunctionLightning);
         yield return ("BlendFunction.TRANSLUCENT preset fields", TestBlendFunctionTranslucent);
         yield return ("BlendFunction.INVERT preset fields", TestBlendFunctionInvert);
@@ -34,6 +34,48 @@ internal static class RenderPipelinesTests
         yield return ("DefaultVertexFormat.POSITION_TEX_COLOR has 3 elements", TestPositionTexColorFormat);
         yield return ("PipelineCache.Precompile hits cache on second call", TestPipelineCacheHit);
         yield return ("PipelineCache.Precompile returns same instance for same declaration", TestPipelineCacheSameInstance);
+        yield return ("WorldRenderPipelines SOLID_TERRAIN no blend depth write", TestSolidTerrainPipelineNoBlend);
+        yield return ("WorldRenderPipelines CUTOUT_TERRAIN has ALPHA_CUTOUT define", TestCutoutTerrainPipelineAlphaCutoutDefine);
+        yield return ("WorldRenderPipelines TRANSLUCENT_TERRAIN uses TRANSLUCENT blend", TestTranslucentTerrainPipelineBlend);
+        yield return ("WorldRenderPipelines terrain pipelines share POSITION_COLOR_UV_LIGHT_NORMAL format", TestTerrainPipelinesVertexFormat);
+    }
+
+    //TestSolidTerrainPipelineNoBlend 验证 SOLID_TERRAIN 无 blend 深度写入 Quads 拓扑
+    private static bool TestSolidTerrainPipelineNoBlend()
+    {
+        var p = WorldRenderPipelines.SOLID_TERRAIN;
+        return p.Location == "pipeline/solid_terrain"
+            && p.ColorTargetStates[0].BlendFunction is null
+            && p.DepthStencilState == DepthStencilState.DEFAULT
+            && p.PrimitiveTopology == PrimitiveTopology.Quads
+            && p.Cull
+            && p.VertexFormatPerBuffer[0] == DefaultVertexFormat.POSITION_COLOR_UV_LIGHT_NORMAL;
+    }
+
+    //TestCutoutTerrainPipelineAlphaCutoutDefine 验证 CUTOUT_TERRAIN 有 ALPHA_CUTOUT define 无 blend
+    private static bool TestCutoutTerrainPipelineAlphaCutoutDefine()
+    {
+        var p = WorldRenderPipelines.CUTOUT_TERRAIN;
+        return p.Location == "pipeline/cutout_terrain"
+            && p.ShaderDefines.Flags.Contains("ALPHA_CUTOUT")
+            && p.ColorTargetStates[0].BlendFunction is null;
+    }
+
+    //TestTranslucentTerrainPipelineBlend 验证 TRANSLUCENT_TERRAIN 用 TRANSLUCENT blend
+    private static bool TestTranslucentTerrainPipelineBlend()
+    {
+        var p = WorldRenderPipelines.TRANSLUCENT_TERRAIN;
+        return p.Location == "pipeline/translucent_terrain"
+            && p.ColorTargetStates[0].BlendFunction == BlendFunction.TRANSLUCENT;
+    }
+
+    //TestTerrainPipelinesVertexFormat 验证 3 个 terrain pipeline 共享 POSITION_COLOR_UV_LIGHT_NORMAL 顶点格式
+    private static bool TestTerrainPipelinesVertexFormat()
+    {
+        var format = DefaultVertexFormat.POSITION_COLOR_UV_LIGHT_NORMAL;
+        return WorldRenderPipelines.SOLID_TERRAIN.VertexFormatPerBuffer[0] == format
+            && WorldRenderPipelines.CUTOUT_TERRAIN.VertexFormatPerBuffer[0] == format
+            && WorldRenderPipelines.TRANSLUCENT_TERRAIN.VertexFormatPerBuffer[0] == format;
     }
 
     private static RenderPipeline BuildSimplePipeline(string location) =>
@@ -168,10 +210,11 @@ internal static class RenderPipelinesTests
             && RenderPipelines.GetByLocation("pipeline/nonexistent") == null;
     }
 
-    //TestAllStaticPipelinesRegistered 验证 RenderPipelines 声明的 15 个 pipeline 全部注册到 location 表
+    //TestAllStaticPipelinesRegistered 验证 RenderPipelines 声明的 18 个 pipeline 全部注册到 location 表
     //覆盖 GUI/GUI_INVERT/GUI_TEXT_HIGHLIGHT/GUI_TEXTURED/GUI_TEXTURED_PREMULTIPLIED_ALPHA/GUI_TEXT/GUI_TEXT_GRAYSCALE
     //F7 新增 GUI_TEXT_SEE_THROUGH/GUI_TEXT_POLYGON_OFFSET/GUI_TEXT_GRAYSCALE_SEE_THROUGH/GUI_TEXT_GRAYSCALE_POLYGON_OFFSET
     //阶段8 新增 BLUR 后处理 pipeline DEBUG_QUADS/BLIT P10 新增 ITEM_3D 3D 物品渲染 pipeline
+    //W6 新增 SOLID_TERRAIN/CUTOUT_TERRAIN/TRANSLUCENT_TERRAIN 世界渲染 terrain pipeline
     private static bool TestAllStaticPipelinesRegistered()
     {
         var all = new (RenderPipeline Pipeline, string Location)[]
@@ -191,6 +234,9 @@ internal static class RenderPipelinesTests
             (RenderPipelines.BLIT, "pipeline/blit"),
             (RenderPipelines.BLUR, "pipeline/blur"),
             (RenderPipelines.ITEM_3D, "pipeline/item_3d"),
+            (WorldRenderPipelines.SOLID_TERRAIN, "pipeline/solid_terrain"),
+            (WorldRenderPipelines.CUTOUT_TERRAIN, "pipeline/cutout_terrain"),
+            (WorldRenderPipelines.TRANSLUCENT_TERRAIN, "pipeline/translucent_terrain"),
         };
         var staticSet = RenderPipelines.GetStaticPipelines();
         foreach (var (pipeline, location) in all)

@@ -27,6 +27,10 @@ internal static class StagedVertexBufferTests
         yield return ("StagedVertexBuffer EndDraw twice is safe", TestEndDrawTwiceSafe);
         yield return ("StagedVertexBuffer EndFrame resets staging", TestEndFrameResets);
         yield return ("StagedVertexBuffer GetVertexBytes returns correct slice", TestGetVertexBytesSlice);
+        yield return ("StagedVertexBuffer VertexBuilder AddVertex3D writes 40 byte POSITION_COLOR_UV_LIGHT_NORMAL", TestVertexBuilderAddVertex3DByteLayout);
+        yield return ("StagedVertexBuffer VertexBuilder AddVertex3D color numeric cast -1 to -1.0f", TestVertexBuilderAddVertex3DColorNumericCast);
+        yield return ("StagedVertexBuffer VertexBuilder AddVertex3D light numeric cast", TestVertexBuilderAddVertex3DLightNumericCast);
+        yield return ("StagedVertexBuffer VertexBuilder AddVertex3D Quads auto generates indices", TestVertexBuilderAddVertex3DQuadsAutoIndex);
     }
 
     //TestQuadsSingleQuad 验证 QUADS 4 顶点生成 6 索引 (0,1,2,2,3,0)
@@ -241,6 +245,83 @@ internal static class StagedVertexBufferTests
         return bytes1.Length == 16 && bytes2.Length == 16
             && MatchesFloat(bytes1, 0, 1f)
             && MatchesFloat(bytes2, 0, 2f);
+    }
+
+    //TestVertexBuilderAddVertex3DByteLayout 验证 POSITION_COLOR_UV_LIGHT_NORMAL 40 字节布局
+    //Position(12)+Color(4)+UV0(8)+Light(4)+Normal(12)=40 AddVertex3D 按 elem.Name 顺序写入
+    private static bool TestVertexBuilderAddVertex3DByteLayout()
+    {
+        var vb = new StagedVertexBuffer();
+        var draw = vb.AppendDraw(DefaultVertexFormat.POSITION_COLOR_UV_LIGHT_NORMAL, PrimitiveTopology.Quads);
+        var builder = vb.GetVertexBuilder(draw);
+        //color=-1=0xFFFFFFFF 白色 light=0x00F000F0 全亮 normal=(0,1,0) Up
+        builder.AddVertex3D(1f, 2f, 3f, -1, 0.5f, 0.25f, 0x00F000F0, 0f, 1f, 0f);
+        vb.EndDraw(draw);
+
+        var bytes = vb.GetVertexBytes(draw);
+        if (bytes.Length != 40) return false;
+        //Position Vec3: 1.0f, 2.0f, 3.0f
+        if (!MatchesFloat(bytes, 0, 1f)) return false;
+        if (!MatchesFloat(bytes, 4, 2f)) return false;
+        if (!MatchesFloat(bytes, 8, 3f)) return false;
+        //Color Float: (float)(-1) = -1.0f
+        if (!MatchesFloat(bytes, 12, -1f)) return false;
+        //UV0 Vec2: 0.5f, 0.25f
+        if (!MatchesFloat(bytes, 16, 0.5f)) return false;
+        if (!MatchesFloat(bytes, 20, 0.25f)) return false;
+        //Light Float: (float)0x00F000F0 = 15728880.0f
+        if (!MatchesFloat(bytes, 24, (float)0x00F000F0)) return false;
+        //Normal Vec3: 0.0f, 1.0f, 0.0f
+        if (!MatchesFloat(bytes, 28, 0f)) return false;
+        if (!MatchesFloat(bytes, 32, 1f)) return false;
+        return MatchesFloat(bytes, 36, 0f);
+    }
+
+    //TestVertexBuilderAddVertex3DColorNumericCast 验证 color int 数值转 float 写入
+    //color=-1(0xFFFFFFFF) 数值转 -1.0f shader int(-1.0f)=-1=0xFFFFFFFF 还原白色
+    //不能用位模式转换 0xFFFFFFFF 位模式是 NaN shader int(NaN) 未定义
+    private static bool TestVertexBuilderAddVertex3DColorNumericCast()
+    {
+        var vb = new StagedVertexBuffer();
+        var draw = vb.AppendDraw(DefaultVertexFormat.POSITION_COLOR_UV_LIGHT_NORMAL, PrimitiveTopology.Quads);
+        var builder = vb.GetVertexBuilder(draw);
+        builder.AddVertex3D(0, 0, 0, -1, 0, 0, 0, 0, 0, 0);
+        vb.EndDraw(draw);
+
+        var bytes = vb.GetVertexBytes(draw);
+        //color offset=12 数值转换 -1 -> -1.0f 字节 BF 80 00 00
+        return MatchesFloat(bytes, 12, -1f);
+    }
+
+    //TestVertexBuilderAddVertex3DLightNumericCast 验证 light int 数值转 float 写入
+    //light=0x00F000F0=15728880 在 2^24 内 float 精确表示无精度损失
+    private static bool TestVertexBuilderAddVertex3DLightNumericCast()
+    {
+        var vb = new StagedVertexBuffer();
+        var draw = vb.AppendDraw(DefaultVertexFormat.POSITION_COLOR_UV_LIGHT_NORMAL, PrimitiveTopology.Quads);
+        var builder = vb.GetVertexBuilder(draw);
+        builder.AddVertex3D(0, 0, 0, 0, 0, 0, 0x00F000F0, 0, 0, 0);
+        vb.EndDraw(draw);
+
+        var bytes = vb.GetVertexBytes(draw);
+        //light offset=24 数值转换 0x00F000F0 -> 15728880.0f
+        return MatchesFloat(bytes, 24, (float)0x00F000F0);
+    }
+
+    //TestVertexBuilderAddVertex3DQuadsAutoIndex 验证 AddVertex3D 4 顶点后 EndDraw 生成 6 索引
+    private static bool TestVertexBuilderAddVertex3DQuadsAutoIndex()
+    {
+        var vb = new StagedVertexBuffer();
+        var draw = vb.AppendDraw(DefaultVertexFormat.POSITION_COLOR_UV_LIGHT_NORMAL, PrimitiveTopology.Quads);
+        var builder = vb.GetVertexBuilder(draw);
+        for (int i = 0; i < 4; i++)
+            builder.AddVertex3D(0, 0, 0, -1, 0, 0, 0x00F000F0, 0, 1, 0);
+        vb.EndDraw(draw);
+
+        return draw.VertexCount == 4
+            && draw.FirstIndex == 0
+            && draw.IndexCount == 6
+            && vb.TotalVertexCount == 4;
     }
 
     //MatchesFloat 验证 bytes[offset..offset+4] 是否等于指定 float 的 little-endian 字节

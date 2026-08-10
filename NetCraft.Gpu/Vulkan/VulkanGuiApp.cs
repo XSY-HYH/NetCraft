@@ -67,6 +67,22 @@ public sealed unsafe class VulkanGuiApp : VulkanAppBase
     //P15 ItemPipRenderer 超大物品 PIP 离屏渲染器注册到 GuiRenderer 按 ItemPipState 分派
     private ItemPipRenderer? _itemPipRenderer;
 
+    //W7 世界渲染资源 depth image + ViewProj UBO + atlas/lightmap sampler descriptor set
+    //IWorldRenderer 由 Game 层注入 VulkanGuiApp 负责 Prepare/Upload/Draw 调度和 GPU 资源管理
+    //用接口避免 NetCraft.Gpu 反向引用 NetCraft.Game 循环依赖
+    private IWorldRenderer? _levelRenderer;
+    private GpuImage? _depthImage;
+    private GpuBuffer? _worldViewProjBuffer;
+    private GpuDescriptorSet? _worldViewProjSet;
+    private GpuDescriptorLayout? _worldViewProjLayout;
+    private GpuDescriptorLayout? _worldSamplerLayout;
+    private GpuDescriptorSet? _worldAtlasSet;
+    private GpuImage? _blockAtlasImage;
+    private GpuImage? _lightmapImage;
+    private GpuSampler? _worldSampler;
+    //世界渲染是否启用 OnRecordCommandBuffer 检查此标志决定是否调世界 RenderPass
+    public bool WorldRenderEnabled => _levelRenderer is not null;
+
     //GuiWindow 外部创建后传入允许测试代码预先布置控件
     public GuiWindow Window { get; }
 
@@ -116,6 +132,16 @@ public sealed unsafe class VulkanGuiApp : VulkanAppBase
     //ItemPipRenderer 超大物品 PIP 渲染器供 GameLayer/测试 RegisterItem 注入物品模型
     //null 表示未创建（OnCreatePipelineResources 前）
     public ItemPipRenderer? ItemPipRenderer => _itemPipRenderer;
+
+    //SetLevelRenderer 注入世界渲染器 Game 层创建 LevelRenderer 后调此方法注入
+    //null 时禁用世界渲染 OnRecordCommandBuffer 跳过世界 RenderPass 只渲染 GUI
+    public void SetLevelRenderer(IWorldRenderer? renderer) => _levelRenderer = renderer;
+
+    //LevelRenderer 性能指标供 GameScreen F3 显示世界渲染统计
+    public int WorldSectionCount => _levelRenderer?.SectionCount ?? 0;
+    public int WorldVisibleSectionCount => _levelRenderer?.VisibleSectionCount ?? 0;
+    public int WorldVertexCount => _levelRenderer?.TotalVertexCount ?? 0;
+    public int WorldDrawCallCount => _levelRenderer?.DrawCallCount ?? 0;
 
     //RegisterTexture 按 path 加载 PNG 注册为纹理返回 textureId 供 GuiImage 引用
     //委托给当前 _resourceManager swapchain 重建后 _resourceManager 已换新 textureId 可能变化
@@ -176,6 +202,7 @@ public sealed unsafe class VulkanGuiApp : VulkanAppBase
         PrecompileGuiPipelines();
         CreateBlurResources(w, h);
         CreateItemAtlasResources();
+        CreateWorldResources(w, h);
         SwapchainRecreated?.Invoke();
     }
 
@@ -193,6 +220,120 @@ public sealed unsafe class VulkanGuiApp : VulkanAppBase
             _guiRenderer.RegisterPipRenderer(_itemPipRenderer);
         }
         _itemAtlasTextureId = _resourceManager.RegisterImage(_itemAtlas.AtlasTexture);
+    }
+
+    //CreateWorldResources 创建世界渲染 GPU 资源 depth image + ViewProj UBO + atlas/lightmap sampler
+    //blockAtlas 首版用 1x1 白色占位纹理 W9 接入真实方块图集 lightmap 用 16x16 全亮占位
+    //swapchain 重建时旧资源 Dispose 后重建匹配新 extent
+    private void CreateWorldResources(int w, int h)
+    {
+        //预编译 3 个 terrain pipeline 避免 OnRecordCommandBuffer 首次编译卡顿
+        var cache = _device.PipelineCache;
+        cache.Precompile(WorldRenderPipelines.SOLID_TERRAIN);
+        cache.Precompile(WorldRenderPipelines.CUTOUT_TERRAIN);
+        cache.Precompile(WorldRenderPipelines.TRANSLUCENT_TERRAIN);
+
+        //depth image D32Sfloat DepthAttachment 与 swapchain 同 extent
+        _depthImage = _device.CreateImage(new GpuImageDescription
+        {
+            Width = w,
+            Height = h,
+            Format = GpuImageFormat.D32Sfloat,
+            Usage = GpuImageUsage.DepthAttachment
+        });
+        //depth image 首次 layout 转换 Undefined→DepthStencilAttachmentOptimal
+        //Upload 对 DepthAttachment 不读像素只做 barrier dynamic rendering 期望 layout 就位
+        _depthImage.Upload(ReadOnlySpan<byte>.Empty);
+
+        //set 0 MATRICES_PROJECTION 1 uniform Mat4 vertex 可见
+        var viewProjLayoutDesc = new GpuDescriptorLayoutDescription();
+        viewProjLayoutDesc.Bindings.Add(new GpuDescriptorBinding
+        {
+            Binding = 0,
+            DescriptorType = GpuDescriptorType.UniformBuffer,
+            StageFlags = GpuShaderStageFlags.Vertex
+        });
+        _worldViewProjLayout = _device.CreateDescriptorLayout(viewProjLayoutDesc);
+        _worldViewProjBuffer = _device.CreateBuffer(64, GpuBufferUsage.UniformBuffer);
+        _worldViewProjSet = _device.AllocateDescriptorSet(_worldViewProjLayout);
+        _worldViewProjSet.WriteBuffer(0, _worldViewProjBuffer, 0, -1);
+
+        //set 1 SAMPLER0_SAMPLER1 atlas + lightmap 双 sampler fragment 可见
+        var samplerLayoutDesc = new GpuDescriptorLayoutDescription();
+        samplerLayoutDesc.Bindings.Add(new GpuDescriptorBinding
+        {
+            Binding = 0,
+            DescriptorType = GpuDescriptorType.CombinedImageSampler,
+            StageFlags = GpuShaderStageFlags.Fragment
+        });
+        samplerLayoutDesc.Bindings.Add(new GpuDescriptorBinding
+        {
+            Binding = 1,
+            DescriptorType = GpuDescriptorType.CombinedImageSampler,
+            StageFlags = GpuShaderStageFlags.Fragment
+        });
+        _worldSamplerLayout = _device.CreateDescriptorLayout(samplerLayoutDesc);
+
+        //blockAtlas 占位 1x1 白色 RGBA8 后续接入真实方块图集
+        _blockAtlasImage = _device.CreateImage(new GpuImageDescription
+        {
+            Width = 1,
+            Height = 1,
+            Format = GpuImageFormat.R8G8B8A8Unorm,
+            Usage = GpuImageUsage.SampledImage
+        });
+        _blockAtlasImage.Upload(new byte[] { 255, 255, 255, 255 });
+
+        //lightmap 占位 16x16 全亮 RGBA8 后续接入真实 LightTexture
+        _lightmapImage = _device.CreateImage(new GpuImageDescription
+        {
+            Width = 16,
+            Height = 16,
+            Format = GpuImageFormat.R8G8B8A8Unorm,
+            Usage = GpuImageUsage.SampledImage
+        });
+        var lightmapPixels = new byte[16 * 16 * 4];
+        for (var i = 0; i < lightmapPixels.Length; i += 4)
+        {
+            lightmapPixels[i] = 255;
+            lightmapPixels[i + 1] = 255;
+            lightmapPixels[i + 2] = 255;
+            lightmapPixels[i + 3] = 255;
+        }
+        _lightmapImage.Upload(lightmapPixels);
+
+        _worldSampler = _device.CreateSampler(new GpuSamplerDescription
+        {
+            LinearFilter = true,
+            RepeatAddress = false
+        });
+
+        _worldAtlasSet = _device.AllocateDescriptorSet(_worldSamplerLayout);
+        _worldAtlasSet.WriteImage(0, _blockAtlasImage, _worldSampler);
+        _worldAtlasSet.WriteImage(1, _lightmapImage, _worldSampler);
+    }
+
+    //DisposeWorldResources 释放世界渲染资源 swapchain 重建和 Cleanup 时调
+    private void DisposeWorldResources()
+    {
+        _depthImage?.Dispose();
+        _worldViewProjBuffer?.Dispose();
+        _worldViewProjSet?.Dispose();
+        _worldViewProjLayout?.Dispose();
+        _worldSamplerLayout?.Dispose();
+        _worldAtlasSet?.Dispose();
+        _blockAtlasImage?.Dispose();
+        _lightmapImage?.Dispose();
+        _worldSampler?.Dispose();
+        _depthImage = null;
+        _worldViewProjBuffer = null;
+        _worldViewProjSet = null;
+        _worldViewProjLayout = null;
+        _worldSamplerLayout = null;
+        _worldAtlasSet = null;
+        _blockAtlasImage = null;
+        _lightmapImage = null;
+        _worldSampler = null;
     }
 
     //CreateFontFromAssets 从 assets/minecraft/font/<id>.json 加载字体配置构造 GlyphFont
@@ -436,6 +577,9 @@ public sealed unsafe class VulkanGuiApp : VulkanAppBase
             CreateBlurResources(w, h);
             //ItemAtlas 不重建只重新注册 AtlasTexture 拿新 textureId 旧 _resourceManager 已 Dispose
             CreateItemAtlasResources();
+            //世界渲染资源 depth image 需匹配新 extent 重建 UBO/sampler 跨 resize 复用但 layout 依赖 _device 不变
+            DisposeWorldResources();
+            CreateWorldResources(w, h);
         }
         oldResourceManager?.Dispose();
         Interlocked.Exchange(ref _latestSnapshot, null);
@@ -583,7 +727,12 @@ public sealed unsafe class VulkanGuiApp : VulkanAppBase
             _resourceManager.UpdateProjection();
             _guiRenderer.Prepare(snapshot);
             _guiRenderer.Upload(_device);
-            if (snapshot.HasBlurSplit && _blurPipeline is not null && _blurOffscreen is not null && _blurTemp is not null)
+            //世界渲染启用时走世界+GUI 叠加 pass blur 后处理暂不与世界渲染同帧 W8 后续优化
+            if (WorldRenderEnabled && _depthImage is not null)
+            {
+                RenderWorldAndGuiPass(cmd, colorImageView, clearColor);
+            }
+            else if (snapshot.HasBlurSplit && _blurPipeline is not null && _blurOffscreen is not null && _blurTemp is not null)
             {
                 RenderBlurPasses(cmd, colorImageView, clearColor);
             }
@@ -607,6 +756,41 @@ public sealed unsafe class VulkanGuiApp : VulkanAppBase
             p => _device.PipelineCache.Precompile(p),
             t => _resourceManager.ResolveDescriptorSet(t));
         pass.Close();
+    }
+
+    //RenderWorldAndGuiPass 世界渲染+GUI 叠加两段 pass
+    //世界 pass 清色清深 Solid→Cutout→Translucent 顺序绘制 terrain
+    //GUI pass LoadOp=Load 保留世界颜色无 depth 叠加 GUI 控件
+    private void RenderWorldAndGuiPass(VulkanCommandBuffer cmd, ImageView colorImageView, Vector4 clearColor)
+    {
+        //上传 ViewProj 矩阵到 UBO Prepare/Upload 世界 mesh 在 Render 线程同步做 W8 改异步
+        _worldViewProjBuffer!.Upload<Matrix4x4>(new[] { _levelRenderer!.ViewProj });
+        _levelRenderer.Prepare();
+        _levelRenderer.Upload(_device);
+
+        //世界 pass 初始 pipeline 用 SOLID_TERRAIN 携带 depth layout DepthStencilAttachmentOptimal
+        //LevelRenderer.Draw 内部 SetPipeline 切换 Solid/Cutout/Translucent 共享同 layout 重复绑 desc 无害
+        using var worldPass = new VulkanRenderPass(_device.Api, _device.DynamicRenderingExt, cmd.Handle,
+            _device.PipelineCache.Precompile(WorldRenderPipelines.SOLID_TERRAIN),
+            colorImageView, clearColor, _depthImage, 1.0f);
+        _levelRenderer.Draw(worldPass,
+            p => _device.PipelineCache.Precompile(p),
+            p =>
+            {
+                p.BindDescriptorSet(_worldViewProjSet!, 0);
+                p.BindDescriptorSet(_worldAtlasSet!, 1);
+            });
+        worldPass.Close();
+
+        //GUI pass LoadOp=Load 保留世界渲染结果 null depth 不附加深度附件
+        using var guiPass = new VulkanRenderPass(_device.Api, _device.DynamicRenderingExt, cmd.Handle,
+            _guiPipeline, colorImageView, clearColor, AttachmentLoadOp.Load, null, 0f);
+        guiPass.BindDescriptorSet(_resourceManager.GlobalsDescriptorSet, 0);
+        guiPass.BindDescriptorSet(_resourceManager.ProjectionDescriptorSet, 1);
+        _guiRenderer.Draw(guiPass,
+            p => _device.PipelineCache.Precompile(p),
+            t => _resourceManager.ResolveDescriptorSet(t));
+        guiPass.Close();
     }
 
     //RenderBlurPasses 分段渲染 BeforeBlur→水平blur→垂直blur→AfterBlur
