@@ -28,9 +28,18 @@ public sealed class ChunkMeshBuilder
         _lightSampler = lightSampler;
     }
 
-    //Build 遍历 section 16³ 方块生成 mesh 数据
-    //originX/Y/Z 是 section 世界基坐标光照查询用默认 0 兼容无世界坐标的单测
+    //Build 遍历 section 16³ 方块生成 mesh 数据 originX/Y/Z 是 section 世界基坐标
+    //regionCache=null 走 W7 越界视为 air 逻辑兼容旧单测
     public ChunkMeshData Build(LevelChunkSection section, int originX = 0, int originY = 0, int originZ = 0)
+        => BuildCore(section, null, originX, originY, originZ);
+
+    //Build 重载接收 RenderRegionCache 跨 section 邻居查询解决边界面剔除
+    //regionCache.Center 应与 section 所在 SectionPos 一致
+    public ChunkMeshData Build(LevelChunkSection section, RenderRegionCache regionCache, int originX, int originY, int originZ)
+        => BuildCore(section, regionCache, originX, originY, originZ);
+
+    //BuildCore 公共编译逻辑 regionCache!=null 时跨 section 面剔除 否则走 W7 越界视为 air
+    private ChunkMeshData BuildCore(LevelChunkSection section, RenderRegionCache? regionCache, int originX, int originY, int originZ)
     {
         var mesh = new ChunkMeshData();
         var pose = new PoseStack();
@@ -47,30 +56,30 @@ public sealed class ChunkMeshBuilder
             pose.PushPose();
             pose.Scale(1f / 16f, 1f / 16f, 1f / 16f);
             //translate 加 sectionOrigin 把顶点 bake 到世界坐标 shader 端 Model=Identity
-            //W7 LevelRenderer 用相机相对坐标减 CameraPosition 大世界 float 精度问题留 W8
             pose.Translate(x + originX, y + originY, z + originZ);
-            AddBlockQuads(pose, section, x, y, z, originX, originY, originZ, model, mesh);
+            AddBlockQuads(pose, section, regionCache, x, y, z, originX, originY, originZ, model, mesh);
             pose.PopPose();
         }
         return mesh;
     }
 
     //AddBlockQuads 把方块的 BakedModel quad 按 layer + cullface 写入 mesh
-    private void AddBlockQuads(PoseStack pose, LevelChunkSection section,
+    private void AddBlockQuads(PoseStack pose, LevelChunkSection section, RenderRegionCache? regionCache,
         int x, int y, int z, int originX, int originY, int originZ, BakedModel model, ChunkMeshData mesh)
     {
         var instance = new QuadInstance();
         foreach (var layer in model.Layers)
         {
             //cullface quad：按方向查邻居 FullBlock 则剔除
-            AddCullfaceQuads(pose, section, x, y, z, originX, originY, originZ, model, layer, mesh, instance);
+            AddCullfaceQuads(pose, section, regionCache, x, y, z, originX, originY, originZ, model, layer, mesh, instance);
             //no-cull quad：总是渲染
             AddNoCullQuads(pose, x, y, z, originX, originY, originZ, model, layer, mesh, instance);
         }
     }
 
-    //AddCullfaceQuads 遍历 6 方向 cullface quad 邻居是 FullBlock 则跳过该方向
-    private void AddCullfaceQuads(PoseStack pose, LevelChunkSection section,
+    //AddCullfaceQuads 遍历 6 方向 cullface quad 邻居是 FullBlock 则跳过
+    //regionCache!=null 跨 section 查邻居 否则走 W7 越界视为 air
+    private void AddCullfaceQuads(PoseStack pose, LevelChunkSection section, RenderRegionCache? regionCache,
         int x, int y, int z, int originX, int originY, int originZ,
         BakedModel model, RenderLayer layer, ChunkMeshData mesh, QuadInstance instance)
     {
@@ -78,7 +87,7 @@ public sealed class ChunkMeshBuilder
         {
             var quads = model.GetCullfaceQuads(layer, dir);
             if (quads.Count == 0) continue;
-            if (ShouldCullFace(section, x, y, z, dir)) continue;
+            if (ShouldCullFace(section, regionCache, x, y, z, originX, originY, originZ, dir)) continue;
             var consumer = mesh.GetOrBeginLayer(layer);
             for (var i = 0; i < quads.Count; i++)
             {
@@ -107,10 +116,13 @@ public sealed class ChunkMeshBuilder
     }
 
     //ShouldCullFace 判断当前方块某方向面是否被邻居遮挡应剔除
-    //邻居坐标超出 section 边界（0-15）视为 air 不剔除（首版不跨 section）
+    //regionCache!=null 跨 section 查邻居世界坐标 否则走 W7 越界视为 air 不剔除
     //邻居 BlockRenderShape==FullBlock 则剔除 Custom/Empty 不剔除
-    private static bool ShouldCullFace(LevelChunkSection section, int x, int y, int z, Direction dir)
+    private static bool ShouldCullFace(LevelChunkSection section, RenderRegionCache? regionCache,
+        int x, int y, int z, int originX, int originY, int originZ, Direction dir)
     {
+        if (regionCache is not null)
+            return regionCache.ShouldCullFace(originX + x, originY + y, originZ + z, dir);
         var offset = dir.UnitVector();
         var nx = x + (int)offset.X;
         var ny = y + (int)offset.Y;

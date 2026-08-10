@@ -60,6 +60,14 @@ public sealed class ItemPipRenderer : PictureInPictureRenderer<ItemPipState>
     private GpuSampler? _blitSampler;
     private int _pipelineWidth;
     private int _pipelineHeight;
+    //双缓冲 offscreen texture+depth+encoder 乒乓本帧写 _writeIndex blit 读 _readIndex
+    //_readIndex=-1 首帧无历史 blit 当前写的同 queue submission order 保证 GPU 端依赖
+    //异步 SubmitAsync 不等 GPU CPU 继续录主 cmd 双 encoder 轮转避免 command buffer 复用竞争
+    private readonly GpuImage?[] _offscreenTextures = new GpuImage[2];
+    private readonly GpuImage?[] _offscreenDepths = new GpuImage[2];
+    private readonly ICommandEncoder?[] _encoders = new ICommandEncoder[2];
+    private int _writeIndex;
+    private int _readIndex = -1;
 
     public override Type RenderStateClass => typeof(ItemPipState);
 
@@ -76,39 +84,47 @@ public sealed class ItemPipRenderer : PictureInPictureRenderer<ItemPipState>
         return state;
     }
 
-    //EnsureTexturesAndProjection 创建 offscreen texture+depth+清屏+透视投影+编译 pipeline
-    //基类 Prepare 在 needsResize=false 时仍调本方法 此时 texture 已存在只更新投影避免每帧重建
+    //EnsureTexturesAndProjection 创建双 offscreen texture+depth+清屏+透视投影+编译 pipeline
+    //基类 Prepare 在 needsResize=false 时仍调本方法 此时双 texture 已存在只更新投影避免每帧重建
     //每帧重建会导致 offscreen texture 泄漏+descriptor set 泄漏 pool 耗尽
     //pipeline viewport 固定到 offscreen 尺寸 尺寸变化时重新编译
     //SupportsGpuRendering=false 时仅创建 texture+设置投影走 CPU 路径供单测 不调 EnsureGpuResources/clear
+    //双 encoder 跨 resize 复用 不在 DisposeTextures 释放避免重建开销
     protected override void EnsureTexturesAndProjection(int width, int height)
     {
-        //texture 已存在复用只更新投影 RenderToGpu 的 LoadOp.Clear 负责每帧清屏
-        if (OffscreenTexture is not null && OffscreenDepth is not null)
+        //双 texture 都已创建复用只更新投影
+        if (_offscreenTextures[0] is not null && _offscreenTextures[1] is not null)
         {
             _projection.SetupPerspective(0.05f, 1000f, MathF.PI / 4f, width, height);
             return;
         }
-        OffscreenTexture = _device.CreateImage(new GpuImageDescription
+        for (var i = 0; i < 2; i++)
         {
-            Width = width,
-            Height = height,
-            Format = GpuImageFormat.R8G8B8A8Unorm,
-            Usage = GpuImageUsage.ColorAttachment | GpuImageUsage.SampledImage
-        });
-        OffscreenDepth = _device.CreateImage(new GpuImageDescription
-        {
-            Width = width,
-            Height = height,
-            Format = GpuImageFormat.D32Sfloat,
-            Usage = GpuImageUsage.DepthAttachment
-        });
+            _offscreenTextures[i] = _device.CreateImage(new GpuImageDescription
+            {
+                Width = width,
+                Height = height,
+                Format = GpuImageFormat.R8G8B8A8Unorm,
+                Usage = GpuImageUsage.ColorAttachment | GpuImageUsage.SampledImage
+            });
+            _offscreenDepths[i] = _device.CreateImage(new GpuImageDescription
+            {
+                Width = width,
+                Height = height,
+                Format = GpuImageFormat.D32Sfloat,
+                Usage = GpuImageUsage.DepthAttachment
+            });
+        }
         //透视投影 offscreen 3D 渲染 MockDevice 也设置投影供测试
         _projection.SetupPerspective(0.05f, 1000f, MathF.PI / 4f, width, height);
+        //基类 OffscreenTexture 设为首个 texture 供基类 needsResize 判断非 null
+        OffscreenTexture = _offscreenTextures[0];
+        OffscreenDepth = _offscreenDepths[0];
         //GPU 资源+初始 clear 仅 SupportsGpuRendering=true 时执行 MockDevice 走 CPU 路径仅生成顶点
         if (!_device.SupportsGpuRendering) return;
-        //OffscreenDepth 初始 layout 转换 Undefined->DepthStencilAttachmentOptimal
-        OffscreenDepth.Upload(ReadOnlySpan<byte>.Empty);
+        //双 depth 初始 layout 转换 Undefined->DepthStencilAttachmentOptimal
+        foreach (var depth in _offscreenDepths)
+            depth!.Upload(ReadOnlySpan<byte>.Empty);
         //pipeline 尺寸变化时重新编译 viewport 固定到 offscreen 尺寸
         if (_pipeline == null || _pipelineWidth != width || _pipelineHeight != height)
         {
@@ -117,10 +133,14 @@ public sealed class ItemPipRenderer : PictureInPictureRenderer<ItemPipState>
             _pipelineHeight = height;
             EnsureGpuResources();
         }
-        //初始 clear offscreen 到不透明黑
-        using (var initEncoder = _device.CreateCommandEncoder())
+        //双 encoder 跨帧复用异步 Submit 乒乓 首次创建后续 resize 复用
+        _encoders[0] ??= _device.CreateCommandEncoder();
+        _encoders[1] ??= _device.CreateCommandEncoder();
+        //初始 clear 双 texture 到不透明黑避免首帧 blit 采样未定义内容
+        for (var i = 0; i < 2; i++)
         {
-            using var initPass = initEncoder.CreateRenderPass(_pipeline!, OffscreenTexture!, new Vector4(0f, 0f, 0f, 1f), OffscreenDepth, 1.0f);
+            using var initEncoder = _device.CreateCommandEncoder();
+            using var initPass = initEncoder.CreateRenderPass(_pipeline!, _offscreenTextures[i]!, new Vector4(0f, 0f, 0f, 1f), _offscreenDepths[i]!, 1.0f);
             initPass.Close();
             initEncoder.Submit();
         }
@@ -227,7 +247,10 @@ public sealed class ItemPipRenderer : PictureInPictureRenderer<ItemPipState>
             RenderToGpu();
     }
 
-    //RenderToGpu 上传顶点 + 更新 MVP UBO + 录制 Vulkan 命令渲染到 OffscreenTexture
+    //RenderToGpu 上传顶点 + 更新 MVP UBO + 录制 Vulkan 命令渲染到 _offscreenTextures[_writeIndex]
+    //双 encoder 乒乓本帧用 _encoders[_writeIndex] 上轮该 encoder 的命令已 SubmitAsync
+    //WaitForCompletion 等上轮完成才能 Reset 复用首次未 SubmitAsync 跳过
+    //SubmitAsync 异步提交不等 GPU CPU 继续录主 cmd 同 queue submission order 保证 GPU 端依赖
     //model=Identity 因 VertexConsumer3D.PutBakedQuad 已在 CPU 端 apply pose
     //透视投影需翻转 Y 和转换 Z 范围匹配 Vulkan
     private void RenderToGpu()
@@ -254,12 +277,16 @@ public sealed class ItemPipRenderer : PictureInPictureRenderer<ItemPipState>
         };
         _mvpUbo!.Upload<MvpUniform>(new[] { mvp });
 
-        using var encoder = _device.CreateCommandEncoder();
-        //跨帧复用 OffscreenTexture 上帧末尾转 ShaderReadOnly 供 blit 采样 本帧渲染前转回 ColorAttachment
-        //首次渲染构造时已 ColorAttachmentOptimal TransitionImageLayout 内部跳过 no-op
-        encoder.TransitionImageLayout(OffscreenTexture!, GpuImageLayout.ColorAttachment);
+        var idx = _writeIndex;
+        var encoder = _encoders[idx]!;
+        //等上一轮该 encoder 完成才能 Reset command buffer 复用首次未 SubmitAsync 跳过
+        encoder.WaitForCompletion();
+        encoder.BeginRecording();
+        //本帧写 texture 上帧末尾转 ShaderReadOnly 供 blit 本帧渲染前转回 ColorAttachment
+        //首次渲染初始 clear 后已 ColorAttachmentOptimal TransitionImageLayout 内部跳过 no-op
+        encoder.TransitionImageLayout(_offscreenTextures[idx]!, GpuImageLayout.ColorAttachment);
         var clearColor = new Vector4(0f, 0f, 0f, 1f);
-        using var pass = encoder.CreateRenderPass(_pipeline!, OffscreenTexture!, clearColor, OffscreenDepth!, 1.0f, GpuLoadOp.Clear);
+        using var pass = encoder.CreateRenderPass(_pipeline!, _offscreenTextures[idx]!, clearColor, _offscreenDepths[idx]!, 1.0f, GpuLoadOp.Clear);
         pass.SetVertexBuffer(0, _vertexBuffer!);
         pass.SetIndexBuffer(_indexBuffer!, GpuIndexType.UInt16);
         pass.BindDescriptorSet(_mvpSet!, 0);
@@ -272,16 +299,57 @@ public sealed class ItemPipRenderer : PictureInPictureRenderer<ItemPipState>
         pass.DrawIndexed(36);
         pass.Close();
         //渲染后转 ShaderReadOnly 供 BlitTexture 采样 不转采样 ColorAttachmentOptimal 纹理驱动崩溃
-        encoder.TransitionImageLayout(OffscreenTexture!, GpuImageLayout.ShaderReadOnly);
-        encoder.Submit();
+        encoder.TransitionImageLayout(_offscreenTextures[idx]!, GpuImageLayout.ShaderReadOnly);
+        //异步 Submit 不等 GPU 完成 CPU 继续录主 cmd blit 读上一帧 texture 无本帧依赖
+        encoder.SubmitAsync();
     }
 
-    //GetBlitTextureSetup 返回 offscreen texture 的 TextureSetup 供 BlitTexture blit 到 GUI
+    //GetBlitTextureSetup 返回读 buffer 的 TextureSetup 供 BlitTexture blit 到 GUI
+    //_readIndex=-1 首帧无历史 blit 当前写的(_writeIndex)同 queue submission order 保证主 cmd 在 PIP 后
+    //_readIndex>=0 后续帧 blit 上一帧写的(_readIndex)已 SubmitAsync 完成无本帧依赖
     //_blitSampler 跨帧复用避免每帧 CreateSampler 泄漏 EnsureGpuResources 时懒创建
     protected override TextureSetup GetBlitTextureSetup()
-        => OffscreenTexture is not null && _blitSampler is not null
-            ? TextureSetup.SingleTexture(OffscreenTexture, _blitSampler)
+    {
+        var idx = _readIndex < 0 ? _writeIndex : _readIndex;
+        var tex = _offscreenTextures[idx];
+        return tex is not null && _blitSampler is not null
+            ? TextureSetup.SingleTexture(tex, _blitSampler)
             : TextureSetup.NoTexture;
+    }
+
+    //BlitTexture override 基类加 BlitRenderState 后翻转读写索引实现乒乓
+    //本帧写的变读下次写另一个双 encoder 轮转避免 command buffer 复用竞争
+    //更新基类 OffscreenTexture 为新读 buffer 供基类 needsResize 判断
+    protected override void BlitTexture(ItemPipState renderState, GuiRenderState guiRenderState)
+    {
+        base.BlitTexture(renderState, guiRenderState);
+        _readIndex = _writeIndex;
+        _writeIndex = 1 - _writeIndex;
+        if (_readIndex >= 0 && _offscreenTextures[_readIndex] is not null)
+        {
+            OffscreenTexture = _offscreenTextures[_readIndex];
+            OffscreenDepth = _offscreenDepths[_readIndex];
+        }
+    }
+
+    //DisposeTextures override 释放双 texture+depth 尺寸变化或 Dispose 时调
+    //先等双 encoder 完成才能释放 texture GPU 不再使用
+    //encoder 跨 resize 复用不在此时释放避免重建开销
+    protected override void DisposeTextures()
+    {
+        foreach (var enc in _encoders)
+            enc?.WaitForCompletion();
+        foreach (var tex in _offscreenTextures)
+            tex?.Dispose();
+        foreach (var depth in _offscreenDepths)
+            depth?.Dispose();
+        Array.Fill(_offscreenTextures, null);
+        Array.Fill(_offscreenDepths, null);
+        OffscreenTexture = null;
+        OffscreenDepth = null;
+        _readIndex = -1;
+        _writeIndex = 0;
+    }
 
     private static byte[] VerticesToBytes(List<float> vertices)
     {
@@ -308,6 +376,10 @@ public sealed class ItemPipRenderer : PictureInPictureRenderer<ItemPipState>
 
     protected override void OnDispose()
     {
+        //双 encoder 释放 DisposeTextures 已 WaitForCompletion 此处 Dispose 不再等 GPU
+        foreach (var enc in _encoders)
+            enc?.Dispose();
+        Array.Fill(_encoders, null);
         _vertexBuffer?.Dispose();
         _indexBuffer?.Dispose();
         _blitSampler?.Dispose();
