@@ -2,9 +2,7 @@
 
 > 本文件是仓库根 [README.md](../README.md) 的中文版，如中英文描述不一致，以英文版为准
 
-**我已竭尽全力，我可能会继续更新也可能不会；项目目前尚不完整，我选择交给社区发展**
-
-**注意：本文档描述的是项目较早期的状态，请以实际代码库为准;各模块的 `Overview.md` 也可能与当前进度不一致，因工作量实在太大，本项目存在可观级别的 AI 痕迹，注释也比较稀疏**
+**持续开发中。M1-M4 已达成，GPU submission/render phase 分离架构重构已完成，正推进 M5（启动+单机 tick）。文档与代码同步维护，各模块 `Overview.md` 反映当前状态。**
 
 用 C# / .NET 10 从零重写 Minecraft 26.2 原版内核。
 
@@ -15,9 +13,9 @@ NetCraft 不是逐行翻译：各子系统按 C# 惯用法重写（`readonly str
 | | |
 |---|---|
 | 当前里程碑 | **M4 已达成**（端到端 TCP 握手），向 M5（启动序列 + 单机 tick）推进 |
-| 整体完成度 | 约 58%（内核框架约 82%，游戏业务层约 60%） |
-| 代码规模 | 19 个内核子模块，约 954 个 `.cs` 文件 |
-| 测试用例 | 814 条（默认 802 + M4 TCP 2 条 + GPU 冒烟 10 条，未显式开启则跳过） |
+| 整体完成度 | 约 65%（内核框架约 85%，游戏业务层约 62%，GPU 约 95%） |
+| 代码规模 | 19 个内核子模块，约 1049 个 `.cs` 文件（GPU 子系统经 submission/render phase 重构后从 30 增至 ~120） |
+| 测试用例 | 1163 条全过 0 失败 0 错误（gpugui 24/24 + guilogic 34/34 + 全套无回归） |
 | 目标框架 | .NET 10 / C# 14，跨平台（不使用 `-windows` TFM，不使用 WinAPI） |
 | 许可证 | GPL-3.0 |
 
@@ -28,7 +26,7 @@ NetCraft 不是逐行翻译：各子系统按 C# 惯用法重写（`readonly str
 - **存档系统** —— MCA 区域文件、`SimpleBitStorage`、4 种 `PalettedContainer` 策略、三优先级抢占式 `IOWorker` 异步调度、`ChunkSource`/`ChunkHolder`/`ChunkMap` 异步管线替代同步 `GetChunk` 等待。
 - **注册表** —— `Identifier` 值类型、per-T `ResourceKey<T>` intern 池、两阶段 `Direct`/`Reference` `Holder<T>` 绑定。
 - **网络** —— `ClientConnection`/`ServerConnection` 状态机、`Varint`/`Varlong` 编解码、包压缩，M4 端到端握手已字节级验证通过。
-- **GPU / GUI** —— 基于 Silk.NET 的 Vulkan 渲染器，单 `RenderPass` 内多 `RenderPipeline` 切换（矩形 / 文本 / 图像 / 反色），Pose 矩阵栈 + 动态 Scissor 栈、`LinearLayout` 布局、`MeasureText`/`GuiTextAlign` 文本对齐、`TabStop`/`TabIndex` 焦点导航。内核 GUI 无业务穿透，scope 仅对齐原版 `blaze3d`。
+- **GPU / GUI** —— 基于 Silk.NET 的 Vulkan 渲染器，采用对标原版 26.2 Blaze3D 的 **submission/render phase 分离架构**：submission 阶段（`GuiRenderContext`）构造不可变 `RenderState` 值对象 → `GuiRenderState`（node tree + strata）；render 阶段（`GuiRenderer`）按 (pipeline, texture, scissor) 排序合批，同组元素合并为 1 个 `DrawCall`。声明式 `Pipeline` + `Snippet` 组合 + `PipelineCache`（运行时零 shader 编译）。dynamic rendering 用 `VkPipelineRenderingCreateInfoKHR`。PIP 离屏 3D 渲染、blur 后处理、九宫格 sprite、动态图集、完整字体 providers 链、3D 物品渲染。Tick/Render 解耦（Tick 独立 20tps 线程，Render 仍串行在窗口循环）。详见 `minecraft/GPU模块重构技术规划.md` 与 `NetCraft.Gpu/Overview.md`。
 - **命令** —— brigadier 完整移植（`LiteralArgumentBuilder`、`RequiredArgumentBuilder`、dispatcher、redirect、`ParsedCommandNode`），100%。
 - **TPGA** —— 独立的认证/代理服务（Yggdrasil API 在 25565 + WSS/API 在 25566，自签证书兜底，ASP.NET Core 异步 I/O，SQLite 主/玩家库物理隔离）。与内核解耦。
 
@@ -51,7 +49,7 @@ NetCraft 不是逐行翻译：各子系统按 C# 惯用法重写（`readonly str
 | 3 | `NetCraft.Network` | 56 | 80% | 连接状态机、编解码 |
 | 3 | `NetCraft.Commands` | 49 | 100% | brigadier 移植 |
 | 4 | `NetCraft.Resources` | 7 | 60% | 资源包框架 |
-| 4 | `NetCraft.Gpu` | 30 | M1 PoC | Vulkan + 内核 GUI |
+| 4 | `NetCraft.Gpu` | ~120 | ~95% | Vulkan + submission/render phase 分离架构（重构已完成，详见 `minecraft/GPU模块重构技术规划.md`） |
 | 4 | `NetCraft.Optimizations` | 10 | 70% | 5/10 已集成（FerriteCore 风格 `FastMap` 等） |
 | - | `NetCraft` | 8 | 90% | 内核入口，把所有子库 DLL 内嵌为资源 |
 | - | `NetCraft.Bootstrap` | 1 | 75% | `BootstrapClass.bootStrap` |

@@ -1,10 +1,6 @@
 # NetCraft
 
-> This document is the Chinese version of [README.md](../README.md) in the repository root. In case of any inconsistency between Chinese and English, the English version shall prevail.
-
-**I've done my best. I may or may not continue updating; the project is currently incomplete, and I'm handing it over to the community to develop.**
-
-**Note: This documentation reflects an older state of the project. Please refer to the actual codebase for the current status. Per-module `Overview.md` files may also be out of sync with progress. Due to the sheer volume of work, this project contains a noticeable amount of AI-generated code, and comments are relatively sparse.**
+**Active development. M1-M4 reached, GPU submission/render phase refactor done, pushing toward M5 (bootstrap + single-player tick). Documentation is kept in sync with the codebase; per-module `Overview.md` reflects current status.**
 
 A from-scratch reimplementation of the Minecraft 26.2 vanilla kernel in C# / .NET 10.
 
@@ -15,9 +11,9 @@ NetCraft is not a port: subsystems are rewritten following C# idioms (readonly s
 | | |
 |---|---|
 | Milestone | **M4 passed** (end-to-end TCP handshake) — pushing toward M5 (bootstrap + single-player tick) |
-| Overall completion | ~58% (kernel framework ~82%, game layer ~60%) |
-| Codebase | ~954 `.cs` files across 19 kernel modules |
-| Tests | 814 cases (802 default + 2 M4 TCP + 10 GPU smoke, skipped unless opted in) |
+| Overall completion | ~65% (kernel framework ~85%, game layer ~62%, GPU ~95%) |
+| Codebase | ~1049 `.cs` files across 19 kernel modules (GPU subsystem grew from 30 to ~120 after submission/render phase refactor) |
+| Tests | 1163 cases all passing 0 failed 0 errored (gpugui 24/24 + guilogic 34/34 + full suite no regression) |
 | Target framework | .NET 10 / C# 14, cross-platform (no `-windows` TFM, no WinAPI) |
 | License | GPL-3.0 |
 
@@ -28,7 +24,7 @@ NetCraft is not a port: subsystems are rewritten following C# idioms (readonly s
 - **Storage** — MCA region files, `SimpleBitStorage`, 4 `PalettedContainer` strategies, `IOWorker` three-priority preemptive async scheduler, `ChunkSource`/`ChunkHolder`/`ChunkMap` async pipeline replacing synchronous `GetChunk` waits.
 - **Registry** — `Identifier` value type, per-T `ResourceKey<T>` intern pool, two-phase `Direct`/`Reference` `Holder<T>` binding.
 - **Network** — `ClientConnection`/`ServerConnection` state machines, `Varint`/`Varlong` codecs, packet compression, M4 end-to-end handshake verified at the byte level.
-- **GPU / GUI** — Vulkan renderer on Silk.NET, multi-`RenderPipeline` switching inside one `RenderPass` (rectangle / text / image / inverted), Pose matrix stack + dynamic Scissor stack, `LinearLayout`, `MeasureText`/`GuiTextAlign` text alignment, `TabStop`/`TabIndex` focus navigation. Business-penetration-free kernel GUI: `blaze3d`-equivalent scope only.
+- **GPU / GUI** — Vulkan renderer on Silk.NET with **submission/render phase separation** mirroring vanilla 26.2 Blaze3D: submission phase (`GuiRenderContext`) constructs immutable `RenderState` value objects → `GuiRenderState` (node tree + strata); render phase (`GuiRenderer`) sorts by (pipeline, texture, scissor) and batches to a single `DrawCall` per group. Declarative `Pipeline` + `Snippet` composition with `PipelineCache` (zero runtime shader compile). Dynamic rendering via `VkPipelineRenderingCreateInfoKHR`. PIP offscreen 3D render, blur post-processing, nine-slice sprite, dynamic atlas, full font providers chain, 3D item rendering. Tick/Render decoupled (Tick on independent 20tps thread, Render still serial in window loop). See `minecraft/GPU模块重构技术规划.md` and `NetCraft.Gpu/Overview.md`.
 - **Commands** — full brigadier port (`LiteralArgumentBuilder`, `RequiredArgumentBuilder`, dispatcher, redirect, `ParsedCommandNode`), 100%.
 - **TPGA** — ancillary auth/proxy service (Yggdrasil API on 25565 + WSS/API on 25566, self-signed cert fallback, ASP.NET Core async I/O, SQLite with master/player DB split). Independent of the kernel.
 
@@ -51,7 +47,7 @@ Layers map directly to dependency tiers. Per-module details live in each `Overvi
 | 3 | `NetCraft.Network` | 56 | 80% | Connection state machines, codecs |
 | 3 | `NetCraft.Commands` | 49 | 100% | brigadier port |
 | 4 | `NetCraft.Resources` | 7 | 60% | Resource pack framework |
-| 4 | `NetCraft.Gpu` | 30 | M1 PoC | Vulkan + kernel GUI |
+| 4 | `NetCraft.Gpu` | ~120 | ~95% | Vulkan + submission/render phase separation (refactor done, see `minecraft/GPU模块重构技术规划.md`) |
 | 4 | `NetCraft.Optimizations` | 10 | 70% | 5/10 integrations (FerriteCore-style `FastMap` etc.) |
 | - | `NetCraft` | 8 | 90% | Kernel entry, embeds all sub-DLLs as resources |
 | - | `NetCraft.Bootstrap` | 1 | 75% | `BootstrapClass.bootStrap` |
