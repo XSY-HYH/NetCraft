@@ -1,6 +1,8 @@
 using System.Numerics;
+using System.Threading;
 using NetCraft.Game.Client.Level;
 using NetCraft.Game.Client.Render;
+using NetCraft.Game.Client.Render.Culling;
 using NetCraft.Game.Client.Render.World;
 using NetCraft.Gpu;
 using NetCraft.Primitives;
@@ -36,6 +38,12 @@ internal static class SectionDispatcherTests
         yield return ("RenderSection PublishMesh to Compiled", TestPublishMesh);
         yield return ("RenderSection Uploaded to Dirty keeps old buffer", TestUploadedToDirtyKeepsBuffer);
         yield return ("RenderSection TryMarkDirty dedup when Queued", TestMarkDirtyDedup);
+        yield return ("Dispatcher single section compiles to upload queue", TestDispatcherSingleSectionCompiles);
+        yield return ("Dispatcher multiple workers compile all sections no loss", TestDispatcherMultipleWorkersNoLoss);
+        yield return ("Dispatcher UploadTerrainBuffers uploads mesh to buffer pool", TestDispatcherUploadTerrainBuffers);
+        yield return ("ViewArea single section visible triggers onNewSection", TestViewAreaSingleSectionVisible);
+        yield return ("ViewArea section out of frustum no callback", TestViewAreaSectionOutOfFrustum);
+        yield return ("Dispatcher SetCameraPosition triggers compile", TestDispatcherSetCameraPositionTriggersCompile);
     }
 
     //单 cube 6 面 * 4 顶点 = 24 顶点 stride 40 字节总 960 字节
@@ -173,6 +181,137 @@ internal static class SectionDispatcherTests
         rs.TryMarkDirty();
         var second = rs.TryMarkDirty();
         return !second && rs.State == RenderSectionState.Queued;
+    }
+
+    //Dispatcher 单 section MarkDirty 后台编译完成入 upload 队列
+    private static bool TestDispatcherSingleSectionCompiles()
+    {
+        var (level, _) = NewLevelWithSections(1);
+        var builder = new ChunkMeshBuilder(_ => NewCubeBakedModel());
+        var (pool, _) = MakePool();
+        using var dispatcher = new SectionRenderDispatcher(level, builder, pool, workerCount: 1);
+        dispatcher.Start();
+        try
+        {
+            dispatcher.MarkDirty(new SectionPos(0, 0, 0));
+            var compiled = SpinWait.SpinUntil(() => dispatcher.PendingUploadCount >= 1, 5000);
+            return compiled && dispatcher.PendingUploadCount >= 1;
+        }
+        finally { dispatcher.Stop(); }
+    }
+
+    //Dispatcher 10 section 2 worker 全部编译无丢失
+    private static bool TestDispatcherMultipleWorkersNoLoss()
+    {
+        const int N = 10;
+        var (level, _) = NewLevelWithSections(N);
+        var builder = new ChunkMeshBuilder(_ => NewCubeBakedModel());
+        var (pool, _) = MakePool();
+        using var dispatcher = new SectionRenderDispatcher(level, builder, pool, workerCount: 2);
+        dispatcher.Start();
+        try
+        {
+            for (var i = 0; i < N; i++)
+                dispatcher.MarkDirty(new SectionPos(i, 0, 0));
+            var compiled = SpinWait.SpinUntil(() => dispatcher.PendingUploadCount >= N, 10000);
+            return compiled && dispatcher.PendingUploadCount >= N;
+        }
+        finally { dispatcher.Stop(); }
+    }
+
+    //Dispatcher UploadTerrainBuffers 编译后上传 mesh 借 vb+ib 设置 Slices
+    private static bool TestDispatcherUploadTerrainBuffers()
+    {
+        var (level, _) = NewLevelWithSections(1);
+        var builder = new ChunkMeshBuilder(_ => NewCubeBakedModel());
+        var (pool, created) = MakePool();
+        using var dispatcher = new SectionRenderDispatcher(level, builder, pool, workerCount: 1);
+        dispatcher.Start();
+        try
+        {
+            var pos = new SectionPos(0, 0, 0);
+            dispatcher.MarkDirty(pos);
+            SpinWait.SpinUntil(() => dispatcher.PendingUploadCount >= 1, 5000);
+            dispatcher.Lock();
+            try { dispatcher.UploadTerrainBuffers(); }
+            finally { dispatcher.Unlock(); }
+            var slice = dispatcher.GetSectionSlice(pos, RenderLayer.Solid);
+            return slice is not null
+                && slice.Value.IndexCount == 36
+                && created.Count >= 2;
+        }
+        finally { dispatcher.Stop(); }
+    }
+
+    //ViewArea 单 section 在视锥内 onNewSection 回调触发 1 次 VisibleCount=1
+    private static bool TestViewAreaSingleSectionVisible()
+    {
+        var (level, _) = NewLevelWithSections(1);
+        var camera = NewCameraLookingAtOrigin();
+        var frustum = new Frustum(camera.GetViewProjMatrix());
+        var viewArea = new ViewArea();
+        var newCount = 0;
+        viewArea.Update(frustum, level, _ => newCount++);
+        return newCount == 1 && viewArea.VisibleCount == 1;
+    }
+
+    //ViewArea section 在 Camera 后方视锥外 onNewSection 不触发 VisibleCount=0
+    private static bool TestViewAreaSectionOutOfFrustum()
+    {
+        var (section, stone) = NewSectionWithAir();
+        section.SetBlockState(0, 0, 0, stone);
+        var level = new ClientLevel();
+        //section 放在 chunk(0,2) 即 z=32~48 在 Camera(8,8,24) 朝 -Z 的后方
+        LoadSection(level, 0, 2, section);
+        var camera = NewCameraLookingAtOrigin();
+        var frustum = new Frustum(camera.GetViewProjMatrix());
+        var viewArea = new ViewArea();
+        var newCount = 0;
+        viewArea.Update(frustum, level, _ => newCount++);
+        return newCount == 0 && viewArea.VisibleCount == 0;
+    }
+
+    //Dispatcher.SetCameraPosition 触发 ViewArea diff 新可见 section 入编译队列完成入 upload 队列
+    private static bool TestDispatcherSetCameraPositionTriggersCompile()
+    {
+        var (level, _) = NewLevelWithSections(1);
+        var builder = new ChunkMeshBuilder(_ => NewCubeBakedModel());
+        var (pool, _) = MakePool();
+        using var dispatcher = new SectionRenderDispatcher(level, builder, pool, workerCount: 1);
+        dispatcher.Start();
+        try
+        {
+            var camera = NewCameraLookingAtOrigin();
+            var frustum = new Frustum(camera.GetViewProjMatrix());
+            dispatcher.SetCameraPosition(camera, frustum);
+            var compiled = SpinWait.SpinUntil(() => dispatcher.PendingUploadCount >= 1, 5000);
+            return compiled && dispatcher.PendingUploadCount >= 1;
+        }
+        finally { dispatcher.Stop(); }
+    }
+
+    //NewCameraLookingAtOrigin Camera 在 (8,8,24) 朝 -Z 看向原点 section(0,0,0) 在视锥内
+    private static Camera NewCameraLookingAtOrigin()
+    {
+        var camera = new Camera();
+        camera.SetPosition(new Vector3(8, 8, 24));
+        camera.UpdatePerspective(MathF.PI / 4f, 800, 600, 0.05f, 1000f);
+        return camera;
+    }
+
+    //NewLevelWithSections 装入 count 个相邻 chunk(i,0) 各一个有 stone 的 section
+    private static (ClientLevel level, BlockState stone) NewLevelWithSections(int count)
+    {
+        var level = new ClientLevel();
+        BlockState stone = default;
+        for (var i = 0; i < count; i++)
+        {
+            var (section, s) = NewSectionWithAir();
+            section.SetBlockState(0, 0, 0, s);
+            stone = s;
+            LoadSection(level, i, 0, section);
+        }
+        return (level, stone);
     }
 
     //BuildSingleCubeMesh 构造单 cube SectionMesh 供布局测试

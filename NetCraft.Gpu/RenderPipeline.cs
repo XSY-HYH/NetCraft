@@ -73,6 +73,8 @@ public sealed class RenderPipelineDescription
     public GpuPrimitiveTopology Topology { get; set; } = GpuPrimitiveTopology.TriangleList;
     //DepthTestEnabled 深度测试
     public bool DepthTestEnabled { get; set; }
+    //DepthCompareOp 深度比较函数 默认 Less VulkanRenderPipeline 从此字段读取不再硬编码
+    public CompareOp DepthCompareOp { get; set; } = CompareOp.Less;
     //BlendEnabled alpha 混合
     public bool BlendEnabled { get; set; }
     //DynamicScissorEnabled 启用 VK_DYNAMIC_STATE_SCISSOR 运行时 vkCmdSetScissor 设置裁剪
@@ -96,6 +98,7 @@ public sealed class RenderPipelineDescription
             FragmentShaderSpirv = shaderManager.LoadFragmentShader(declaration.FragmentShader, declaration.ShaderDefines),
             Topology = ToLegacyTopology(declaration.PrimitiveTopology),
             DepthTestEnabled = declaration.DepthStencilState != null,
+            DepthCompareOp = declaration.DepthStencilState?.DepthTest ?? CompareOp.Less,
             BlendEnabled = declaration.ColorTargetStates.Count > 0 && declaration.ColorTargetStates[0].BlendFunction != null,
             DynamicScissorEnabled = true,
             TargetFormat = ToLegacyFormat(declaration.ColorTargetStates[0].Format)

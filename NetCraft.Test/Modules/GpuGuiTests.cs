@@ -1,6 +1,18 @@
 using System.Numerics;
+using NetCraft.Game.Client.Level;
+using NetCraft.Game.Client.Render;
+using NetCraft.Game.Client.Render.Culling;
+using NetCraft.Game.Client.Render.World;
 using NetCraft.Gpu;
 using NetCraft.Gpu.Vulkan;
+using NetCraft.Primitives;
+using NetCraft.Registry;
+using NetCraft.Registry.State;
+using NetCraft.Storage;
+using NetCraft.Storage.Chunk;
+using NetCraft.Storage.Paletted;
+using Direction = NetCraft.Gpu.Direction;
+using HeightmapRegistry = NetCraft.Registry.Heightmap;
 
 namespace NetCraft.Test.Modules;
 
@@ -14,6 +26,11 @@ internal static class GpuGuiTests
 
     public static IEnumerable<(string Name, Func<bool> Test)> All()
     {
+        if (Environment.GetEnvironmentVariable("NETCRAFT_W85") is not null)
+        {
+            yield return ("Vulkan world renderer 8x8 sections renders 300 frames", TestWorldRendererRenders300Frames);
+            yield break;
+        }
         yield return ("Vulkan triangle renders 60 frames", TestTriangleRenders60Frames);
         yield return ("Vulkan triangle renders 300 frames", TestTriangleRenders300Frames);
         yield return ("Vulkan cube renders 60 frames", TestCubeRenders60Frames);
@@ -38,6 +55,7 @@ internal static class GpuGuiTests
         yield return ("Vulkan PIP offscreen+blit renders 60 frames", TestPipRenders60Frames);
         yield return ("Vulkan PIP offscreen+blit renders 300 frames", TestPipRenders300Frames);
         yield return ("Vulkan PIP performance benchmark under threshold", TestPipPerformanceBenchmark);
+        yield return ("Vulkan world renderer 8x8 sections renders 300 frames", TestWorldRendererRenders300Frames);
     }
 
     //testItemAtlasDrawToSlotWritesPixels 验证 DrawToSlot 实际写入 AtlasTexture 槽位区域
@@ -669,5 +687,151 @@ internal static class GpuGuiTests
             return false;
         }
         return true;
+    }
+
+    //testWorldRendererRenders300Frames W8.5 LevelRenderer+SectionRenderDispatcher 集成 VulkanGuiApp
+    //8x8 section 相机静止 300 帧验证异步编译+Upload+Draw 链路无崩溃 buffer 无泄漏
+    //SwapchainRecreated 时创建 dispatcher+LevelRenderer 注入 app 第一帧 Prepare 触发编译后续帧 Upload+Draw
+    //验证 uploaded==64（8x8 全编译上传）bufferInUse==uploaded*2（每 section vb+ib 无泄漏）drawCall>0
+    private static bool TestWorldRendererRenders300Frames()
+    {
+        bool result = false;
+        RunOnStaThread(() =>
+        {
+            using var app = new VulkanGuiApp(800, 600);
+            SectionRenderDispatcher? dispatcher = null;
+            LevelRenderer? renderer = null;
+            try
+            {
+                app.SwapchainRecreated += () =>
+                {
+                    var level = NewLevelWith8x8Sections();
+                    var camera = new Camera();
+                    //camera 在 (64,8,300) 朝 -Z fov 90° 视锥覆盖 0..128 x 0..16 z 0..128
+                    camera.SetPosition(new Vector3(64, 8, 300));
+                    camera.UpdatePerspective(MathF.PI / 2f, 800, 600, 0.05f, 1000f);
+                    var builder = new ChunkMeshBuilder(_ => NewCubeBakedModel());
+                    var pool = new GpuBufferPool((size, usage) => app.Device.CreateHostVisibleBuffer(size, usage));
+                    dispatcher = new SectionRenderDispatcher(level, builder, pool, workerCount: 2);
+                    dispatcher.Start();
+                    renderer = new LevelRenderer(level, camera, dispatcher);
+                    app.SetLevelRenderer(renderer);
+                };
+                app.RunFor(300);
+                if (dispatcher is null || renderer is null) return;
+                //Stop dispatcher 确保 worker 不再修改状态再计数
+                dispatcher.Stop();
+                var uploaded = dispatcher.UploadedSectionCount;
+                var bufferInUse = dispatcher.BufferPoolInUseCount;
+                Console.WriteLine($"[WorldRender] uploaded={uploaded}/64 bufferInUse={bufferInUse} drawCall={app.WorldDrawCallCount} renderCpu={app.RenderCpuMs:F3}ms");
+                result = app.WorldDrawCallCount > 0
+                    && uploaded == 64
+                    && bufferInUse == uploaded * 2;
+            }
+            finally
+            {
+                renderer?.Dispose();
+                dispatcher?.Dispose();
+            }
+        });
+        return result;
+    }
+
+    //NewLevelWith8x8Sections 装入 8x8 chunk 各 1 个有 stone 的 section 共 64 section
+    private static ClientLevel NewLevelWith8x8Sections()
+    {
+        var level = new ClientLevel();
+        for (var cx = 0; cx < 8; cx++)
+        for (var cz = 0; cz < 8; cz++)
+        {
+            var (section, stone) = NewSectionWithAir();
+            section.SetBlockState(0, 0, 0, stone);
+            var chunk = new TestChunkAccess(new ChunkPos(cx, cz), 0, 1, section);
+            level.LoadChunk(chunk);
+        }
+        return level;
+    }
+
+    //NewSectionWithAir 创建全 air section 返回 section 与 stone BlockState
+    private static (LevelChunkSection section, BlockState stone) NewSectionWithAir()
+    {
+        var factory = new DefaultPalettedContainerFactory();
+        var airBlock = new MockBlock(Identifier.WithDefaultNamespace("air"));
+        var stoneBlock = new MockBlock(Identifier.WithDefaultNamespace("stone"));
+        factory.RegisterBlock(airBlock);
+        factory.RegisterBlock(stoneBlock);
+        var section = new LevelChunkSection(factory.CreateForBlockStates(), factory.CreateForBiomes());
+        return (section, stoneBlock.DefaultBlockState);
+    }
+
+    //NewCubeBakedModel 6 面 cube BakedModel 全 Solid layer
+    private static BakedModel NewCubeBakedModel()
+    {
+        var model = new BakedModel();
+        var uv0 = new Vector2(0, 0);
+        var uv1 = new Vector2(1, 0);
+        var uv2 = new Vector2(1, 1);
+        var uv3 = new Vector2(0, 1);
+        model.AddQuad(RenderLayer.Solid, new BakedQuad(
+            new(0, 0, 16), new(0, 0, 0), new(16, 0, 0), new(16, 0, 16),
+            uv0, uv1, uv2, uv3, Direction.Down), Direction.Down);
+        model.AddQuad(RenderLayer.Solid, new BakedQuad(
+            new(0, 16, 0), new(0, 16, 16), new(16, 16, 16), new(16, 16, 0),
+            uv0, uv1, uv2, uv3, Direction.Up), Direction.Up);
+        model.AddQuad(RenderLayer.Solid, new BakedQuad(
+            new(0, 16, 0), new(0, 0, 0), new(16, 0, 0), new(16, 16, 0),
+            uv0, uv1, uv2, uv3, Direction.North), Direction.North);
+        model.AddQuad(RenderLayer.Solid, new BakedQuad(
+            new(16, 16, 16), new(16, 0, 16), new(0, 0, 16), new(0, 16, 16),
+            uv0, uv1, uv2, uv3, Direction.South), Direction.South);
+        model.AddQuad(RenderLayer.Solid, new BakedQuad(
+            new(0, 16, 16), new(0, 0, 16), new(0, 0, 0), new(0, 16, 0),
+            uv0, uv1, uv2, uv3, Direction.West), Direction.West);
+        model.AddQuad(RenderLayer.Solid, new BakedQuad(
+            new(16, 16, 0), new(16, 0, 0), new(16, 0, 16), new(16, 16, 16),
+            uv0, uv1, uv2, uv3, Direction.East), Direction.East);
+        return model;
+    }
+
+    //TestChunkAccess 测试用 ChunkAccess 具体子类单 section
+    private sealed class TestChunkAccess : ChunkAccess
+    {
+        private readonly ChunkPos _pos;
+        private readonly Dictionary<HeightmapRegistry.Types, long[]> _heightmaps;
+        private readonly LevelChunkSection? _section;
+
+        public override ChunkPos Pos => _pos;
+        public override int MinSectionY { get; }
+        public override int SectionsCount { get; }
+        public override ChunkStatus ChunkStatus { get; }
+        public override IDictionary<HeightmapRegistry.Types, long[]> Heightmaps => _heightmaps;
+
+        public TestChunkAccess(ChunkPos pos, int minSectionY, int sectionsCount, LevelChunkSection? section = null)
+        {
+            _pos = pos;
+            MinSectionY = minSectionY;
+            SectionsCount = sectionsCount;
+            _heightmaps = new Dictionary<HeightmapRegistry.Types, long[]>();
+            _section = section;
+            ChunkStatus = ChunkStatus.EMPTY;
+        }
+
+        public override LevelChunkSection? GetSection(int sectionY)
+            => sectionY == MinSectionY ? _section : null;
+    }
+
+    //MockBlock 测试用 Block 子类
+    private sealed class MockBlock : Block
+    {
+        public override Identifier Id { get; }
+        public override BlockState DefaultBlockState { get; }
+
+        public MockBlock(Identifier id)
+        {
+            Id = id;
+            var state = BlockStateRegistry.Register(this, Array.Empty<PropertyBase>(), Array.Empty<object?>());
+            BlockStateRegistry.InitializeNeighbors(state.Id, Array.Empty<int[]>());
+            DefaultBlockState = state;
+        }
     }
 }

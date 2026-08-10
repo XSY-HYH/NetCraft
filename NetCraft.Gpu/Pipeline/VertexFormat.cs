@@ -91,4 +91,15 @@ public static class DefaultVertexFormat
         .Add("Light", VertexElementFormat.Float)
         .Add("Normal", VertexElementFormat.Vec3)
         .Build();
+
+    //POSITION_COLOR_TEX_OVERLAY_LIGHT_NORMAL 实体顶点格式对标原版 entity 格式
+    //比方块多 Overlay 属性伤害红闪用 stride 44 字节 color/light/overlay 用 Float 存 packed int
+    public static readonly VertexFormat POSITION_COLOR_TEX_OVERLAY_LIGHT_NORMAL = VertexFormat.Create()
+        .Add("Position", VertexElementFormat.Vec3)
+        .Add("Color", VertexElementFormat.Float)
+        .Add("UV0", VertexElementFormat.Vec2)
+        .Add("Overlay", VertexElementFormat.Float)
+        .Add("Light", VertexElementFormat.Float)
+        .Add("Normal", VertexElementFormat.Vec3)
+        .Build();
 }

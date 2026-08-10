@@ -82,6 +82,8 @@ var modules = new (string Name, Func<IEnumerable<(string, Func<bool>)>> Loader)[
     (CameraFrustumTests.Module, CameraFrustumTests.All),
     (LevelRendererTests.Module, LevelRendererTests.All),
     (SectionDispatcherTests.Module, SectionDispatcherTests.All),
+    (EntityRenderTests.Module, EntityRenderTests.All),
+    (LightTextureTests.Module, LightTextureTests.All),
     //ReloadableServerResourcesTests 调 BootstrapClass.BootStrap 冻结所有注册表
     //必须放在所有需要写注册表的测试之后否则后续测试无法注册抛 Registry is already frozen
     (ReloadableServerResourcesTests.Module, ReloadableServerResourcesTests.All),

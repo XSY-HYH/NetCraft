@@ -224,13 +224,15 @@ public sealed unsafe class VulkanRenderPipeline : CompiledRenderPipeline
         colorBlending.BlendConstants[2] = 0.0f;
         colorBlending.BlendConstants[3] = 0.0f;
 
-        //depthTest=true 时启用深度测试和写入深度比较函数 Less 前向剔除
+        //depthTest=true 时启用深度测试和写入深度比较函数从 description 读不再硬编码
+        //DepthStencilState.DEFAULT 用 GreaterOrEqual 配合 reversed-Z clearDepth=0 但 Vulkan 标准 [0,1] Less+clearDepth=1
+        //当前 Camera 投影用标准 Vulkan 深度 Less 匹配 terrain pipeline 用 GreaterOrEqual 匹配实体 pipeline
         var depthStencil = new PipelineDepthStencilStateCreateInfo
         {
             SType = StructureType.PipelineDepthStencilStateCreateInfo,
             DepthTestEnable = description.DepthTestEnabled ? Vk.True : Vk.False,
             DepthWriteEnable = description.DepthTestEnabled ? Vk.True : Vk.False,
-            DepthCompareOp = CompareOp.Less,
+            DepthCompareOp = ToVkCompareOp(description.DepthCompareOp),
             DepthBoundsTestEnable = Vk.False,
             MinDepthBounds = 0f,
             MaxDepthBounds = 1f,
@@ -330,6 +332,20 @@ public sealed unsafe class VulkanRenderPipeline : CompiledRenderPipeline
         GpuPrimitiveTopology.LineList => PrimitiveTopology.LineList,
         GpuPrimitiveTopology.PointList => PrimitiveTopology.PointList,
         _ => throw new ArgumentOutOfRangeException(nameof(topo))
+    };
+
+    //ToVkCompareOp 把 NetCraft.Gpu.Pipeline.CompareOp 映射到 Silk.NET.Vulkan.CompareOp
+    private static Silk.NET.Vulkan.CompareOp ToVkCompareOp(NetCraft.Gpu.Pipeline.CompareOp op) => op switch
+    {
+        NetCraft.Gpu.Pipeline.CompareOp.Never => Silk.NET.Vulkan.CompareOp.Never,
+        NetCraft.Gpu.Pipeline.CompareOp.Less => Silk.NET.Vulkan.CompareOp.Less,
+        NetCraft.Gpu.Pipeline.CompareOp.Equal => Silk.NET.Vulkan.CompareOp.Equal,
+        NetCraft.Gpu.Pipeline.CompareOp.LessOrEqual => Silk.NET.Vulkan.CompareOp.LessOrEqual,
+        NetCraft.Gpu.Pipeline.CompareOp.Greater => Silk.NET.Vulkan.CompareOp.Greater,
+        NetCraft.Gpu.Pipeline.CompareOp.NotEqual => Silk.NET.Vulkan.CompareOp.NotEqual,
+        NetCraft.Gpu.Pipeline.CompareOp.GreaterOrEqual => Silk.NET.Vulkan.CompareOp.GreaterOrEqual,
+        NetCraft.Gpu.Pipeline.CompareOp.Always => Silk.NET.Vulkan.CompareOp.Always,
+        _ => Silk.NET.Vulkan.CompareOp.Less
     };
 
     public override void Dispose()

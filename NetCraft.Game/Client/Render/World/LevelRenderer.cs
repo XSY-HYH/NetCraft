@@ -1,155 +1,137 @@
 using System.Numerics;
 using NetCraft.Game.Client.Level;
+using NetCraft.Game.Client.Render.Culling;
+using NetCraft.Game.Client.Render.Entity;
 using NetCraft.Gpu;
 using NetCraft.Gpu.Pipeline;
 using NetCraft.Primitives;
-using NetCraft.Storage.Chunk;
 
 namespace NetCraft.Game.Client.Render.World;
 
 //LevelRenderer 世界渲染主入口对标原版 LevelRenderer
-//持 StagedVertexBuffer+ClientLevel+ChunkMeshBuilder+Camera 遍历可见 section 构建 mesh 上传 GPU
-//Prepare 阶段每帧重建所有 section mesh W8 改异步缓存
-//Draw 阶段按 Solid→Cutout→Translucent 顺序 DrawIndexed 深度测试 GEQUAL
-//顶点格式 POSITION_COLOR_UV_LIGHT_NORMAL stride 40 字节 CPU 端 bake section offset shader Model=Identity
+//W8 改造：删 StagedVertexBuffer 同步构建 持 SectionRenderDispatcher 异步编译 Render 线程只做 Upload+Draw
+//Prepare 构造 frustum 调 dispatcher.SetCameraPosition 触发 ViewArea diff 新可见 section 入编译队列
+//Upload 调 dispatcher.UploadTerrainBuffers Lock 内上传编译完成的 mesh
+//Draw 按 Solid→Cutout→Translucent 顺序遍历 EnumerateVisibleSections 取 GetSectionSlice 提交
+//每 section 独立 DrawCall 100 section=300 DrawCall uber buffer 合批留优化
+//顶点格式 POSITION_COLOR_UV_LIGHT_NORMAL stride 40 字节 section offset 在 ChunkMeshBuilder 已 bake shader Model=Identity
+//订阅 level.SectionDirty 转发 dispatcher.MarkDirty 扩散自身+6邻居
 public sealed class LevelRenderer : IDisposable, IWorldRenderer
 {
     //POSITION_COLOR_UV_LIGHT_NORMAL 顶点 stride 40 字节 Position(12)+Color(4)+UV0(8)+Light(4)+Normal(12)
     private const int VertexStride = 40;
-    private const int FloatsPerVertex = 10;
 
-    private readonly StagedVertexBuffer _vertexBuffer = new();
     private readonly ClientLevel _level;
-    private readonly ChunkMeshBuilder _meshBuilder;
     private readonly Camera _camera;
+    private readonly SectionRenderDispatcher _dispatcher;
+    private readonly Action<SectionPos> _sectionDirtyHandler;
+    //可见 section 缓冲跨帧复用避免每帧分配 List
+    private readonly List<RenderSection> _visibleSectionBuffer = new();
 
-    //每个 RenderLayer 一个 Draw 累积所有可见 section 的顶点
-    private readonly Dictionary<RenderLayer, Draw> _layerDraws = new();
+    //本帧 frustum Prepare 构造 Draw 复用
+    private Frustum? _frustum;
+    //本帧总顶点数 Draw 内累加供 F3 显示
+    private int _totalVertexCount;
+    //EntityDispatcher 实体渲染调度器 null 时不渲染实体由 Game 层注入
+    public EntityRenderDispatcher? EntityDispatcher { get; set; }
 
     //性能指标供 GameScreen F3 显示
-    public int SectionCount { get; private set; }
-    public int VisibleSectionCount { get; private set; }
-    public int TotalVertexCount => _vertexBuffer.TotalVertexCount;
+    public int SectionCount => _dispatcher.SectionCount;
+    public int VisibleSectionCount => _dispatcher.VisibleSectionCount;
+    public int TotalVertexCount => _totalVertexCount;
     public int DrawCallCount { get; private set; }
 
     //ViewProj 当前帧 view*proj 矩阵 VulkanGuiApp 读此属性上传 set 0 UBO
     public Matrix4x4 ViewProj => _camera.GetViewProjMatrix();
 
-    public LevelRenderer(ClientLevel level, Camera camera, ChunkMeshBuilder meshBuilder)
+    public LevelRenderer(ClientLevel level, Camera camera, SectionRenderDispatcher dispatcher)
     {
         _level = level;
         _camera = camera;
-        _meshBuilder = meshBuilder;
+        _dispatcher = dispatcher;
+        _sectionDirtyHandler = pos => _dispatcher.MarkDirty(pos);
+        _level.SectionDirty += _sectionDirtyHandler;
     }
 
-    //Prepare 遍历可见 section 调 ChunkMeshBuilder.Build 写 StagedVertexBuffer
-    //frustum culling 跳过视体外 section 每帧重建所有 mesh W8 改异步缓存
+    //Prepare 构造 frustum 调 dispatcher.SetCameraPosition 触发 ViewArea diff 新可见 section 入编译队列
+    //W7 同步遍历 Build 已删除 mesh 构建移到 dispatcher 后台线程
     public void Prepare()
     {
-        _vertexBuffer.EndFrame();
-        _layerDraws.Clear();
-        SectionCount = 0;
-        VisibleSectionCount = 0;
-
-        var viewProj = _camera.GetViewProjMatrix();
-        var frustum = new Culling.Frustum(viewProj);
-
-        foreach (var chunk in _level.GetLoadedChunks())
-        {
-            var sectionsCount = chunk.SectionsCount;
-            for (var sy = 0; sy < sectionsCount; sy++)
-            {
-                var section = chunk.GetSection(sy);
-                if (section is null || section.HasOnlyAir()) continue;
-                SectionCount++;
-
-                var originX = chunk.Pos.X * 16;
-                var originY = sy * 16;
-                var originZ = chunk.Pos.Z * 16;
-
-                //frustum culling AABB 是 section 世界坐标范围
-                var aabb = new AABB(originX, originY, originZ, originX + 16, originY + 16, originZ + 16);
-                if (!frustum.IsVisible(aabb)) continue;
-                VisibleSectionCount++;
-
-                var mesh = _meshBuilder.Build(section, originX, originY, originZ);
-                AppendMeshToBuffer(mesh);
-            }
-        }
-
-        //锁定所有 Draw 生成索引
-        foreach (var draw in _layerDraws.Values)
-            _vertexBuffer.EndDraw(draw);
+        _frustum = new Frustum(_camera.GetViewProjMatrix());
+        _dispatcher.SetCameraPosition(_camera, _frustum);
+        EntityDispatcher?.Prepare(_camera.Position);
     }
 
-    //AppendMeshToBuffer 把 ChunkMeshData 各 layer 顶点拷贝到 StagedVertexBuffer 对应 Draw
-    //VertexConsumer3D.Vertices 是 List<float> 每 10 float 一顶点逐顶点调 AddVertex3D
-    private void AppendMeshToBuffer(ChunkMeshData mesh)
+    //Upload 调 dispatcher.UploadTerrainBuffers Lock 内上传编译完成的 mesh 到 GpuBufferPool 借出的 buffer
+    //device 参数保留兼容 IWorldRenderer 签名 dispatcher 内部用 GpuBufferPool 绑定的 device
+    public void Upload(GpuDevice device)
     {
-        foreach (var layer in mesh.Layers)
-        {
-            var consumer = mesh.GetOrBeginLayer(layer);
-            if (consumer.VertexCount == 0) continue;
-
-            if (!_layerDraws.TryGetValue(layer, out var draw))
-            {
-                draw = _vertexBuffer.AppendDraw(
-                    DefaultVertexFormat.POSITION_COLOR_UV_LIGHT_NORMAL,
-                    PrimitiveTopology.Quads);
-                _layerDraws[layer] = draw;
-            }
-
-            var builder = _vertexBuffer.GetVertexBuilder(draw);
-            var vertices = consumer.Vertices;
-            var vertexCount = vertices.Count / FloatsPerVertex;
-            for (var i = 0; i < vertexCount; i++)
-            {
-                var off = i * FloatsPerVertex;
-                //color/light 是 int 数值转换存 float 读出 (int)float 还原再传 AddVertex3D
-                builder.AddVertex3D(
-                    vertices[off + 0], vertices[off + 1], vertices[off + 2],
-                    (int)vertices[off + 3],
-                    vertices[off + 4], vertices[off + 5],
-                    (int)vertices[off + 6],
-                    vertices[off + 7], vertices[off + 8], vertices[off + 9]);
-            }
-        }
+        _dispatcher.Lock();
+        try { _dispatcher.UploadTerrainBuffers(); }
+        finally { _dispatcher.Unlock(); }
+        EntityDispatcher?.Upload(device);
     }
 
-    //Upload 上传顶点/索引到 GPU 跨帧复用 buffer size 不够才重建
-    public void Upload(GpuDevice device) => _vertexBuffer.Upload(device);
-
-    //Draw 按 Solid→Cutout→Translucent 顺序渲染 SetPipeline+BindDescriptorSet+DrawIndexed
-    //pipelineResolver 由 VulkanGuiApp 传入调 PipelineCache.Precompile
-    //descBinder 由 VulkanGuiApp 传入绑定 set 0 ViewProj UBO + set 1 atlas/lightmap sampler
+    //Draw 按 Solid→Cutout→Translucent 顺序遍历可见 section 取 GetSectionSlice 提交
+    //pipeline 按 layer 切换每 layer 一次 SetPipeline+descBinder section 内每 layer 一次 DrawCall
+    //Lock 内遍历保证 Upload 与 Draw 间 buffer 引用不被回收
     public void Draw(IRenderPass pass,
         Func<RenderPipeline, CompiledRenderPipeline> pipelineResolver,
         Action<IRenderPass> descBinder)
     {
         DrawCallCount = 0;
-        foreach (var layer in new[] { RenderLayer.Solid, RenderLayer.Cutout, RenderLayer.Translucent })
+        _totalVertexCount = 0;
+        if (_frustum is null) return;
+        _dispatcher.Lock();
+        try
         {
-            if (!_layerDraws.TryGetValue(layer, out var draw)) continue;
-            if (draw.IndexCount == 0) continue;
-
-            var pipeline = layer switch
+            _visibleSectionBuffer.Clear();
+            foreach (var section in _dispatcher.EnumerateVisibleSections(_frustum))
             {
-                RenderLayer.Solid => WorldRenderPipelines.SOLID_TERRAIN,
-                RenderLayer.Cutout => WorldRenderPipelines.CUTOUT_TERRAIN,
-                RenderLayer.Translucent => WorldRenderPipelines.TRANSLUCENT_TERRAIN,
-                _ => throw new InvalidOperationException($"未知 RenderLayer {layer}")
-            };
-            var info = _vertexBuffer.GetExecuteInfo(draw);
-
-            pass.SetPipeline(pipelineResolver(pipeline));
+                _visibleSectionBuffer.Add(section);
+                if (section.Mesh is not null) _totalVertexCount += section.Mesh.TotalVertexCount;
+            }
+            foreach (var layer in s_layers)
+            {
+                var pipeline = layer switch
+                {
+                    RenderLayer.Solid => WorldRenderPipelines.SOLID_TERRAIN,
+                    RenderLayer.Cutout => WorldRenderPipelines.CUTOUT_TERRAIN,
+                    RenderLayer.Translucent => WorldRenderPipelines.TRANSLUCENT_TERRAIN,
+                    _ => throw new InvalidOperationException($"未知 RenderLayer {layer}")
+                };
+                pass.SetPipeline(pipelineResolver(pipeline));
+                descBinder(pass);
+                //terrain pipeline 启用 VK_DYNAMIC_STATE_SCISSOR draw 前必须 CmdSetScissor 否则驱动未定义行为
+                pass.DisableScissor();
+                foreach (var section in _visibleSectionBuffer)
+                {
+                    var slice = _dispatcher.GetSectionSlice(section.Pos, layer);
+                    if (slice is null) continue;
+                    pass.SetVertexBuffer(0, slice.Value.VertexBuffer, (ulong)slice.Value.BaseVertex * VertexStride);
+                    pass.SetIndexBuffer(slice.Value.IndexBuffer, GpuIndexType.UInt32);
+                    pass.DrawIndexed(slice.Value.IndexCount, 1, slice.Value.FirstIndex, 0, 0);
+                    DrawCallCount++;
+                }
+            }
+        }
+        finally { _dispatcher.Unlock(); }
+        //实体渲染在 terrain 之后同一 world pass 内 depth test 保证遮挡正确
+        //实体用 ENTITY_CUTOUT pipeline 共用 set 0 ViewProj + set 1 atlas/lightmap
+        if (EntityDispatcher is not null && EntityDispatcher.HasContent)
+        {
+            pass.SetPipeline(pipelineResolver(EntityRenderPipelines.ENTITY_CUTOUT));
             descBinder(pass);
-            //BaseVertex 是顶点偏移转字节偏移 SetVertexBuffer 的 offset 参数
-            pass.SetVertexBuffer(0, info.VertexBuffer, (ulong)info.BaseVertex * VertexStride);
-            pass.SetIndexBuffer(info.IndexBuffer!, GpuIndexType.UInt32);
-            pass.DrawIndexed(info.IndexCount);
+            pass.DisableScissor();
+            EntityDispatcher.Draw(pass);
             DrawCallCount++;
         }
     }
 
-    public void Dispose() => _vertexBuffer.Dispose();
+    public void Dispose()
+    {
+        _level.SectionDirty -= _sectionDirtyHandler;
+    }
+
+    private static readonly RenderLayer[] s_layers = { RenderLayer.Solid, RenderLayer.Cutout, RenderLayer.Translucent };
 }

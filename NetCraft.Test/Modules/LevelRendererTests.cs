@@ -1,6 +1,7 @@
 using System.Numerics;
 using NetCraft.Game.Client.Level;
 using NetCraft.Game.Client.Render;
+using NetCraft.Game.Client.Render.Culling;
 using NetCraft.Game.Client.Render.World;
 using NetCraft.Gpu;
 using NetCraft.Primitives;
@@ -14,16 +15,17 @@ using HeightmapRegistry = NetCraft.Registry.Heightmap;
 
 namespace NetCraft.Test.Modules;
 
-//LevelRendererTests 世界渲染主入口单元测试
-//覆盖 Prepare 遍历 section + frustum culling + 按 layer 分组到 StagedVertexBuffer
-//用 TestChunkAccess 装入 ClientLevel + mock BakedModel 避免依赖 GPU
+//LevelRendererTests 世界渲染场景单元测试
+//W8 改造：LevelRenderer.Prepare 不再同步构建 mesh 核心断言下移到 ChunkMeshBuilder/SectionMesh/ViewArea
+//覆盖空级别/单 section/frustum 剔除/air 跳过/多 layer/section 计数 6 个场景
+//与 SectionDispatcherTests 互补聚焦 LevelRenderer 原有测试场景
 internal static class LevelRendererTests
 {
     public const string Module = "levelrenderer";
 
     public static IEnumerable<(string Name, Func<bool> Test)> All()
     {
-        yield return ("LevelRenderer empty level produces zero vertices", TestEmptyLevel);
+        yield return ("LevelRenderer empty level produces zero visible sections", TestEmptyLevel);
         yield return ("LevelRenderer single section produces solid vertices", TestSingleSection);
         yield return ("LevelRenderer frustum culls sections behind camera", TestFrustumCullingBehind);
         yield return ("LevelRenderer air section skipped", TestAirSectionSkipped);
@@ -31,105 +33,97 @@ internal static class LevelRendererTests
         yield return ("LevelRenderer sectionCount and visibleSectionCount tracked", TestSectionCountTracking);
     }
 
-    //空 ClientLevel 无 chunk Prepare 后 0 顶点 0 可见 section
+    //空 ClientLevel 无 chunk ViewArea.Update 后 0 可见 section
     private static bool TestEmptyLevel()
     {
-        var (renderer, _, _) = NewLevelRendererWithCamera();
-        renderer.Prepare();
-        return renderer.TotalVertexCount == 0
-            && renderer.VisibleSectionCount == 0
-            && renderer.DrawCallCount == 0;
+        var level = new ClientLevel();
+        var camera = NewCameraLookingAtOrigin();
+        var frustum = new Frustum(camera.GetViewProjMatrix());
+        var viewArea = new ViewArea();
+        viewArea.Update(frustum, level);
+        return viewArea.VisibleCount == 0;
     }
 
-    //单 section 有 stone 方块 Prepare 后 Solid layer 有 24 顶点（6 面 * 4）
+    //单 section 有 stone 方块 ChunkMeshBuilder.Build 后 Solid layer 有 24 顶点（6 面 * 4）
     private static bool TestSingleSection()
     {
-        var (renderer, level, _) = NewLevelRendererWithCamera();
         var (section, stone) = NewSectionWithAir();
         section.SetBlockState(0, 0, 0, stone);
-        LoadSection(level, 0, 0, section);
-        renderer.Prepare();
+        var builder = new ChunkMeshBuilder(_ => NewCubeBakedModel());
+        var data = builder.Build(section);
+        var mesh = SectionMesh.FromChunkMeshData(data);
         //单方块 6 面 * 4 = 24 顶点
-        return renderer.TotalVertexCount == 24
-            && renderer.VisibleSectionCount == 1;
+        return mesh.GetVertexCount(RenderLayer.Solid) == 24
+            && mesh.TotalVertexCount == 24;
     }
 
-    //section 在 Camera 后方被 frustum 剔除 VisibleSectionCount=0
+    //section 在 Camera 后方被 frustum 剔除 ViewArea.VisibleCount=0
     private static bool TestFrustumCullingBehind()
     {
-        var (renderer, level, _) = NewLevelRendererWithCamera();
-        //Camera 在 (8,8,24) 朝 -Z 前方 z 减小 后方 z 增大 section 放在 chunk(0,2) 即 z=32~48 在 Camera 后方
         var (section, stone) = NewSectionWithAir();
         section.SetBlockState(0, 0, 0, stone);
+        var level = new ClientLevel();
+        //Camera 在 (8,8,24) 朝 -Z 前方 z 减小 后方 z 增大 section 放在 chunk(0,2) 即 z=32~48 在 Camera 后方
         LoadSection(level, 0, 2, section);
-        renderer.Prepare();
-        return renderer.VisibleSectionCount == 0
-            && renderer.TotalVertexCount == 0;
+        var camera = NewCameraLookingAtOrigin();
+        var frustum = new Frustum(camera.GetViewProjMatrix());
+        var viewArea = new ViewArea();
+        viewArea.Update(frustum, level);
+        return viewArea.VisibleCount == 0;
     }
 
-    //全 air section 被 HasOnlyAir 跳过不计入 SectionCount
+    //全 air section 被 HasOnlyAir 跳过不计入 VisibleCount
     private static bool TestAirSectionSkipped()
     {
-        var (renderer, level, _) = NewLevelRendererWithCamera();
         var (section, _) = NewSectionWithAir();
+        var level = new ClientLevel();
         LoadSection(level, 0, 0, section);
-        renderer.Prepare();
-        return renderer.SectionCount == 0
-            && renderer.VisibleSectionCount == 0;
+        var camera = NewCameraLookingAtOrigin();
+        var frustum = new Frustum(camera.GetViewProjMatrix());
+        var viewArea = new ViewArea();
+        viewArea.Update(frustum, level);
+        return viewArea.VisibleCount == 0;
     }
 
-    //Solid + Cutout 双 layer 产出 2 个 Draw（DrawCallCount 在 Draw 后才更新 Prepare 阶段验证 TotalVertexCount）
+    //Solid + Cutout 双 layer SectionMesh 分离 Solid 24 + Cutout 4 = 28 顶点
     private static bool TestMultipleLayers()
     {
-        var (renderer, level, _) = NewLevelRendererWithMultiLayerBuilder();
         var (section, stone) = NewSectionWithAir();
         section.SetBlockState(0, 0, 0, stone);
-        LoadSection(level, 0, 0, section);
-        renderer.Prepare();
+        var builder = new ChunkMeshBuilder(_ => NewMultiLayerBakedModel());
+        var data = builder.Build(section);
+        var mesh = SectionMesh.FromChunkMeshData(data);
         //Solid 6 面 * 4 = 24 + Cutout 1 quad * 4 = 4 = 28
-        return renderer.TotalVertexCount == 28;
+        return mesh.GetVertexCount(RenderLayer.Solid) == 24
+            && mesh.GetVertexCount(RenderLayer.Cutout) == 4
+            && mesh.TotalVertexCount == 28;
     }
 
-    //SectionCount 统计非空 section 数 VisibleSectionCount 统计视体内 section 数
+    //视体内 section 可见 视体外 section 不可见 ViewArea.VisibleCount=1
     private static bool TestSectionCountTracking()
     {
-        var (renderer, level, _) = NewLevelRendererWithCamera();
-        //视体内 section
         var (section1, stone) = NewSectionWithAir();
         section1.SetBlockState(0, 0, 0, stone);
+        var level = new ClientLevel();
         LoadSection(level, 0, 0, section1);
         //视体外 section（在 Camera 后方 chunk(0,5) 即 z=80~96）
         var (section2, _) = NewSectionWithAir();
         section2.SetBlockState(0, 0, 0, stone);
         LoadSection(level, 0, 5, section2);
-        renderer.Prepare();
-        return renderer.SectionCount == 2
-            && renderer.VisibleSectionCount == 1;
+        var camera = NewCameraLookingAtOrigin();
+        var frustum = new Frustum(camera.GetViewProjMatrix());
+        var viewArea = new ViewArea();
+        viewArea.Update(frustum, level);
+        return viewArea.VisibleCount == 1;
     }
 
-    //NewLevelRendererWithCamera 创建 Camera 在 (8,8,24) 朝 -Z 的 LevelRenderer
-    //Camera 看向原点 section(0,0,0) 在视体内 section(0,0,-2) 在视体外
-    private static (LevelRenderer renderer, ClientLevel level, Camera camera) NewLevelRendererWithCamera()
+    //NewCameraLookingAtOrigin Camera 在 (8,8,24) 朝 -Z 看向原点 section(0,0,0) 在视体内
+    private static Camera NewCameraLookingAtOrigin()
     {
-        var level = new ClientLevel();
         var camera = new Camera();
         camera.SetPosition(new Vector3(8, 8, 24));
         camera.UpdatePerspective(MathF.PI / 4f, 800, 600, 0.05f, 1000f);
-        var builder = new ChunkMeshBuilder(_ => NewCubeBakedModel());
-        var renderer = new LevelRenderer(level, camera, builder);
-        return (renderer, level, camera);
-    }
-
-    //NewLevelRendererWithMultiLayerBuilder 用多 layer BakedModel 的 builder
-    private static (LevelRenderer renderer, ClientLevel level, Camera camera) NewLevelRendererWithMultiLayerBuilder()
-    {
-        var level = new ClientLevel();
-        var camera = new Camera();
-        camera.SetPosition(new Vector3(8, 8, 24));
-        camera.UpdatePerspective(MathF.PI / 4f, 800, 600, 0.05f, 1000f);
-        var builder = new ChunkMeshBuilder(_ => NewMultiLayerBakedModel());
-        var renderer = new LevelRenderer(level, camera, builder);
-        return (renderer, level, camera);
+        return camera;
     }
 
     //LoadSection 把 section 装入 ClientLevel 的指定 chunkZ 位置 sectionY=0

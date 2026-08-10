@@ -22,7 +22,7 @@ internal static class RenderPipelinesTests
         yield return ("RenderPipelines.GUI registered with correct location", TestGuiRegistered);
         yield return ("RenderPipelines.GetStaticPipelines contains GUI variants", TestGetStaticPipelines);
         yield return ("RenderPipelines.GetByLocation returns registered pipeline", TestGetByLocation);
-        yield return ("RenderPipelines all 18 static pipelines registered with location", TestAllStaticPipelinesRegistered);
+        yield return ("RenderPipelines all 21 static pipelines registered with location", TestAllStaticPipelinesRegistered);
         yield return ("BlendFunction.LIGHTNING preset fields", TestBlendFunctionLightning);
         yield return ("BlendFunction.TRANSLUCENT preset fields", TestBlendFunctionTranslucent);
         yield return ("BlendFunction.INVERT preset fields", TestBlendFunctionInvert);
@@ -38,6 +38,14 @@ internal static class RenderPipelinesTests
         yield return ("WorldRenderPipelines CUTOUT_TERRAIN has ALPHA_CUTOUT define", TestCutoutTerrainPipelineAlphaCutoutDefine);
         yield return ("WorldRenderPipelines TRANSLUCENT_TERRAIN uses TRANSLUCENT blend", TestTranslucentTerrainPipelineBlend);
         yield return ("WorldRenderPipelines terrain pipelines share POSITION_COLOR_UV_LIGHT_NORMAL format", TestTerrainPipelinesVertexFormat);
+        yield return ("EntityRenderPipelines ENTITY_SOLID no blend depth DEFAULT", TestEntitySolidPipelineNoBlend);
+        yield return ("EntityRenderPipelines ENTITY_CUTOUT has ALPHA_CUTOUT define", TestEntityCutoutPipelineAlphaCutoutDefine);
+        yield return ("EntityRenderPipelines ENTITY_TRANSLUCENT uses TRANSLUCENT blend", TestEntityTranslucentPipelineBlend);
+        yield return ("EntityRenderPipelines share POSITION_COLOR_TEX_OVERLAY_LIGHT_NORMAL format", TestEntityPipelinesVertexFormat);
+        yield return ("EntityRenderPipelines share ENTITY_SNIPPET Quads topology", TestEntityPipelinesTopology);
+        yield return ("DepthStencilState.DEFAULT DepthTest is CompareOp.Less", TestDepthStencilDefaultCompareOp);
+        yield return ("Custom DepthStencilState GreaterOrEqual preserves DepthTest", TestCustomDepthStencilCompareOp);
+        yield return ("DepthStencilState null DepthTest defaults to Less in FromDeclaration", TestNullDepthStencilDefaultsLess);
     }
 
     //TestSolidTerrainPipelineNoBlend 验证 SOLID_TERRAIN 无 blend 深度写入 Quads 拓扑
@@ -76,6 +84,73 @@ internal static class RenderPipelinesTests
         return WorldRenderPipelines.SOLID_TERRAIN.VertexFormatPerBuffer[0] == format
             && WorldRenderPipelines.CUTOUT_TERRAIN.VertexFormatPerBuffer[0] == format
             && WorldRenderPipelines.TRANSLUCENT_TERRAIN.VertexFormatPerBuffer[0] == format;
+    }
+
+    //TestEntitySolidPipelineNoBlend 验证 ENTITY_SOLID 无 blend 深度 DEFAULT Quads 拓扑
+    private static bool TestEntitySolidPipelineNoBlend()
+    {
+        var p = EntityRenderPipelines.ENTITY_SOLID;
+        return p.Location == "pipeline/entity_solid"
+            && p.ColorTargetStates[0].BlendFunction is null
+            && p.DepthStencilState == DepthStencilState.DEFAULT
+            && p.PrimitiveTopology == PrimitiveTopology.Quads;
+    }
+
+    //TestEntityCutoutPipelineAlphaCutoutDefine 验证 ENTITY_CUTOUT 有 ALPHA_CUTOUT define 无 blend
+    private static bool TestEntityCutoutPipelineAlphaCutoutDefine()
+    {
+        var p = EntityRenderPipelines.ENTITY_CUTOUT;
+        return p.Location == "pipeline/entity_cutout"
+            && p.ShaderDefines.Flags.Contains("ALPHA_CUTOUT")
+            && p.ColorTargetStates[0].BlendFunction is null;
+    }
+
+    //TestEntityTranslucentPipelineBlend 验证 ENTITY_TRANSLUCENT 用 TRANSLUCENT blend
+    private static bool TestEntityTranslucentPipelineBlend()
+    {
+        var p = EntityRenderPipelines.ENTITY_TRANSLUCENT;
+        return p.Location == "pipeline/entity_translucent"
+            && p.ColorTargetStates[0].BlendFunction == BlendFunction.TRANSLUCENT;
+    }
+
+    //TestEntityPipelinesVertexFormat 验证 3 个 entity pipeline 共享 POSITION_COLOR_TEX_OVERLAY_LIGHT_NORMAL
+    private static bool TestEntityPipelinesVertexFormat()
+    {
+        var format = DefaultVertexFormat.POSITION_COLOR_TEX_OVERLAY_LIGHT_NORMAL;
+        return EntityRenderPipelines.ENTITY_SOLID.VertexFormatPerBuffer[0] == format
+            && EntityRenderPipelines.ENTITY_CUTOUT.VertexFormatPerBuffer[0] == format
+            && EntityRenderPipelines.ENTITY_TRANSLUCENT.VertexFormatPerBuffer[0] == format;
+    }
+
+    //TestEntityPipelinesTopology 验证 3 个 entity pipeline 共享 Quads 拓扑
+    private static bool TestEntityPipelinesTopology()
+    {
+        return EntityRenderPipelines.ENTITY_SOLID.PrimitiveTopology == PrimitiveTopology.Quads
+            && EntityRenderPipelines.ENTITY_CUTOUT.PrimitiveTopology == PrimitiveTopology.Quads
+            && EntityRenderPipelines.ENTITY_TRANSLUCENT.PrimitiveTopology == PrimitiveTopology.Quads;
+    }
+
+    //TestDepthStencilDefaultCompareOp 验证 DEFAULT 深度比较函数是 Less 供 DepthCompareOp 读取
+    private static bool TestDepthStencilDefaultCompareOp()
+    {
+        return DepthStencilState.DEFAULT.DepthTest == CompareOp.Less
+            && DepthStencilState.DEFAULT.WriteDepth;
+    }
+
+    //TestCustomDepthStencilCompareOp 验证自定义深度状态保留 DepthTest 供 VulkanRenderPipeline 读取
+    private static bool TestCustomDepthStencilCompareOp()
+    {
+        var custom = new DepthStencilState(CompareOp.GreaterOrEqual, true);
+        return custom.DepthTest == CompareOp.GreaterOrEqual
+            && custom.WriteDepth;
+    }
+
+    //TestNullDepthStencilDefaultsLess 验证 RenderPipelineDescription 默认 DepthCompareOp=Less
+    //FromDeclaration 当 DepthStencilState null 时取此默认值
+    private static bool TestNullDepthStencilDefaultsLess()
+    {
+        var desc = new RenderPipelineDescription();
+        return desc.DepthCompareOp == CompareOp.Less;
     }
 
     private static RenderPipeline BuildSimplePipeline(string location) =>
@@ -210,11 +285,12 @@ internal static class RenderPipelinesTests
             && RenderPipelines.GetByLocation("pipeline/nonexistent") == null;
     }
 
-    //TestAllStaticPipelinesRegistered 验证 RenderPipelines 声明的 18 个 pipeline 全部注册到 location 表
+    //TestAllStaticPipelinesRegistered 验证 RenderPipelines 声明的 21 个 pipeline 全部注册到 location 表
     //覆盖 GUI/GUI_INVERT/GUI_TEXT_HIGHLIGHT/GUI_TEXTURED/GUI_TEXTURED_PREMULTIPLIED_ALPHA/GUI_TEXT/GUI_TEXT_GRAYSCALE
     //F7 新增 GUI_TEXT_SEE_THROUGH/GUI_TEXT_POLYGON_OFFSET/GUI_TEXT_GRAYSCALE_SEE_THROUGH/GUI_TEXT_GRAYSCALE_POLYGON_OFFSET
     //阶段8 新增 BLUR 后处理 pipeline DEBUG_QUADS/BLIT P10 新增 ITEM_3D 3D 物品渲染 pipeline
     //W6 新增 SOLID_TERRAIN/CUTOUT_TERRAIN/TRANSLUCENT_TERRAIN 世界渲染 terrain pipeline
+    //W9 新增 ENTITY_SOLID/ENTITY_CUTOUT/ENTITY_TRANSLUCENT 实体渲染 pipeline
     private static bool TestAllStaticPipelinesRegistered()
     {
         var all = new (RenderPipeline Pipeline, string Location)[]
@@ -237,6 +313,9 @@ internal static class RenderPipelinesTests
             (WorldRenderPipelines.SOLID_TERRAIN, "pipeline/solid_terrain"),
             (WorldRenderPipelines.CUTOUT_TERRAIN, "pipeline/cutout_terrain"),
             (WorldRenderPipelines.TRANSLUCENT_TERRAIN, "pipeline/translucent_terrain"),
+            (EntityRenderPipelines.ENTITY_SOLID, "pipeline/entity_solid"),
+            (EntityRenderPipelines.ENTITY_CUTOUT, "pipeline/entity_cutout"),
+            (EntityRenderPipelines.ENTITY_TRANSLUCENT, "pipeline/entity_translucent"),
         };
         var staticSet = RenderPipelines.GetStaticPipelines();
         foreach (var (pipeline, location) in all)
@@ -288,7 +367,7 @@ internal static class RenderPipelinesTests
     private static bool TestDepthStencilStateDefault()
     {
         var d = DepthStencilState.DEFAULT;
-        return d.DepthTest == CompareOp.GreaterOrEqual
+        return d.DepthTest == CompareOp.Less
             && d.WriteDepth
             && d.DepthBiasScaleFactor == 0f
             && d.DepthBiasConstant == 0f;
